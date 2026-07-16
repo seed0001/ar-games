@@ -17,6 +17,7 @@
  */
 import * as THREE from 'three';
 import { tlog, flush } from './telemetry.js';
+import { RECORD_BYTES } from './world-format.js';
 
 const CAP = 1_500_000;               // max points per world (~15 MB binary)
 const PAGE = 250_000;                // points per GPU geometry page
@@ -210,7 +211,7 @@ export class WorldScanner {
         this.state = 'review';
         this.showSaveDialog();
         const meta = this.hud.querySelector('.save-meta');
-        if (meta) meta.textContent = 'Demo terrain (no AR on this device) · ' + this.count.toLocaleString() + ' points';
+        if (meta) meta.textContent = 'Demo terrain (no AR on this device) · ' + this.count.toLocaleString() + ' points · ' + fmtBytes(this.count * RECORD_BYTES);
       }
     } else if (m.type === 'encoded') {
       const r = this._encodeResolve;
@@ -531,6 +532,7 @@ export class WorldScanner {
     this.hud.innerHTML = `
       <div class="scan-top">
         <span class="scan-stat" id="scan-pts">0 pts</span>
+        <span class="scan-stat" id="scan-size">0 KB</span>
         <span class="scan-stat" id="scan-area">0 m²</span>
         <span class="scan-stat" id="scan-time">0:00</span>
       </div>
@@ -561,6 +563,7 @@ export class WorldScanner {
     const q = (id) => this.hud.querySelector('#' + id);
     if (!q('scan-pts')) return;
     q('scan-pts').textContent = this.count.toLocaleString() + ' pts';
+    q('scan-size').textContent = fmtBytes(this.count * RECORD_BYTES);
     q('scan-area').textContent = Math.round(this._ground * 1.64) + ' m²';
     const s = Math.floor((performance.now() - this._startedAt) / 1000);
     q('scan-time').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
@@ -608,7 +611,7 @@ export class WorldScanner {
       <div class="save-dialog">
         <div class="save-card">
           <h3>🌍 World captured</h3>
-          <p class="save-meta">${this.count.toLocaleString()} points · ~${Math.round(this._ground * 1.64)} m² covered</p>
+          <p class="save-meta">${this.count.toLocaleString()} points · ${fmtBytes(this.count * RECORD_BYTES)} · ~${Math.round(this._ground * 1.64)} m² covered</p>
           <input id="world-name" type="text" maxlength="40" placeholder="Name this world (e.g. Front Yard)" autocomplete="off">
           <div class="save-error hidden" id="save-error"></div>
           <div class="save-progress hidden" id="save-progress"><div class="save-progress-fill" id="save-progress-fill"></div></div>
@@ -878,6 +881,14 @@ function buildMeshMaterial() {
         fragColor = vec4(mix(wire, solid, faceAlpha), 1.0);
       }`,
   });
+}
+
+// human-readable byte size (1 KB = 1024 B)
+function fmtBytes(b) {
+  if (!b || b < 0) return '0 KB';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return Math.round(b / 1024) + ' KB';
+  return (b / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
 function mulberry32(seed) {

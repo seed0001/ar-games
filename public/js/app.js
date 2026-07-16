@@ -157,6 +157,14 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// human-readable byte size (1 KB = 1024 B)
+function fmtBytes(b) {
+  if (!b || b < 0) return '0 KB';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return Math.round(b / 1024) + ' KB';
+  return (b / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
 $('modal-close').addEventListener('click', () => $('modal').classList.add('hidden'));
 $('modal').addEventListener('click', (e) => {
   if (e.target === $('modal')) $('modal').classList.add('hidden');
@@ -269,7 +277,7 @@ async function showWorldsGallery() {
       <div class="world-row" data-id="${w.id}">
         <div class="world-info">
           <span class="world-name">${escapeHtml(w.name)}</span>
-          <span class="world-meta">by ${escapeHtml(w.username)} · ${(w.points / 1000).toFixed(0)}k pts · ${w.created.slice(0, 10)}</span>
+          <span class="world-meta">by ${escapeHtml(w.username)} · ${(w.points / 1000).toFixed(0)}k pts · ${fmtBytes(w.size)} · ${w.created.slice(0, 10)}</span>
         </div>
         ${w.mine ? `<button class="world-del" data-del="${w.id}" title="Delete">🗑</button>` : ''}
       </div>
