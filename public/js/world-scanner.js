@@ -63,6 +63,8 @@ export class WorldScanner {
     this._postedAt = 0;
     this._depthLogged = false;
     this._loggedDepthStatus = '';
+    this._lastXRFrame = 0;
+    this._xrDeadLogged = false;
   }
 
   /* ---------------- lifecycle ---------------- */
@@ -137,6 +139,21 @@ export class WorldScanner {
     }
     this.session = session;
 
+    // three r164's WebXRManager sees 'depth-sensing' among enabledFeatures and
+    // calls the GPU depth API (XRWebGLBinding.getDepthInformation) for its own
+    // occlusion feature. On a cpu-optimized session Chrome throws
+    // InvalidStateError, which kills three's XR frame chain on the first
+    // tracked frame — the AR feed freezes while the DOM HUD stays alive.
+    // Shadow the property so three never sees the feature; we read the depth
+    // buffer ourselves via frame.getDepthInformation (the CPU API).
+    let threeDepthHidden = false;
+    try {
+      const feats = session.enabledFeatures
+        ? Array.from(session.enabledFeatures).filter((f) => f !== 'depth-sensing') : [];
+      Object.defineProperty(session, 'enabledFeatures', { configurable: true, get: () => feats });
+      threeDepthHidden = !session.enabledFeatures.includes('depth-sensing');
+    } catch (e) { /* shadow failed — telemetry below records it */ }
+
     try { this.renderer.xr.setReferenceSpaceType('local-floor'); }
     catch (e) { this.renderer.xr.setReferenceSpaceType('local'); }
     await this.renderer.xr.setSession(session);
@@ -162,6 +179,7 @@ export class WorldScanner {
       features: session.enabledFeatures ? Array.from(session.enabledFeatures) : null,
       depthUsage, depthFormat,
       glBinding: !!this.glBinding,
+      threeDepthHidden,
     });
     flush();
   }
@@ -259,6 +277,19 @@ export class WorldScanner {
         }
         st.lastEmit = now;
         st.frames = 0; st.maxGap = 0; st.capMs = 0; st.appendMs = 0;
+      }
+
+      // three's XR frame chain can die independently of the window rAF that
+      // keeps this tick alive (an exception inside WebXRManager kills only the
+      // XR loop). If we're presenting but XR frames stop arriving, say so.
+      if (frame) this._lastXRFrame = now;
+      else if (this.state === 'scanning' && this.renderer.xr.isPresenting &&
+               this._lastXRFrame && now - this._lastXRFrame > 2500 && !this._xrDeadLogged) {
+        this._xrDeadLogged = true;
+        this._lastErr = 'XR frame loop died — restart the scan';
+        tlog('xr-frames-dead', { pts: this.count, at: Math.round(now - this._startedAt) });
+        flush();
+        this.setHint('The AR tracking loop stalled — back out and start the scan again.');
       }
 
       if (this.state === 'scanning' && frame &&
