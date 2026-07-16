@@ -239,6 +239,31 @@ app.delete('/api/worlds/:id', auth(), (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------------- client telemetry (field-debugging the AR scanner) ---------------- */
+const CLIENT_LOG = path.join(DATA_DIR, 'client-log.jsonl');
+const MAX_CLIENT_LOG_BYTES = 20 * 1024 * 1024;
+
+app.post('/api/clientlog', auth(false), (req, res) => {
+  try {
+    const { sid, ua, events } = req.body || {};
+    if (Array.isArray(events) && events.length) {
+      const entry = {
+        at: new Date().toISOString(),
+        user: req.user ? req.user.username : null,
+        sid: String(sid || '').slice(0, 16),
+        ua: String(ua || '').slice(0, 300),
+        events: events.slice(0, 500),
+      };
+      const line = JSON.stringify(entry);
+      let size = 0;
+      try { size = fs.statSync(CLIENT_LOG).size; } catch (e) { /* not created yet */ }
+      if (size < MAX_CLIENT_LOG_BYTES) fs.appendFileSync(CLIENT_LOG, line + '\n');
+      console.log('[clientlog]', line.slice(0, 4000));
+    }
+  } catch (e) { /* telemetry must never 500 */ }
+  res.json({ ok: true });
+});
+
 app.use('/vendor/three', express.static(path.join(__dirname, 'node_modules/three/build'), { maxAge: '7d' }));
 app.use(express.static(path.join(__dirname, 'public')));
 

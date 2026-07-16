@@ -8,6 +8,7 @@
  */
 import * as THREE from 'three';
 import { decodePoints } from './world-format.js';
+import { clampPointSize } from './world-scanner.js';
 
 const EYE = 1.7;
 const DIORAMA_SIZE = 1.4; // metres, longest side when placed on your floor
@@ -50,6 +51,7 @@ export class WorldExplorer {
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3, true));
     this.baseSize = 0.055;
     this.material = new THREE.PointsMaterial({ size: this.baseSize, vertexColors: true, sizeAttenuation: true });
+    clampPointSize(this.material, 12.0);
     this.cloud = new THREE.Points(geo, this.material);
     this.cloud.frustumCulled = false;
     this.worldGroup = new THREE.Group();

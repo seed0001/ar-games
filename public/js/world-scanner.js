@@ -16,6 +16,7 @@
  * save/upload/explore pipeline still works everywhere.
  */
 import * as THREE from 'three';
+import { tlog, flush } from './telemetry.js';
 
 const CAP = 1_500_000;               // max points per world (~15 MB binary)
 const PAGE = 250_000;                // points per GPU geometry page
@@ -54,6 +55,14 @@ export class WorldScanner {
     this._depthStatus = 'waiting for depth…';
     this._startedAt = 0;
     this._stopped = false;
+
+    // rolling per-second telemetry window
+    this._stats = { frames: 0, maxGap: 0, capMs: 0, appendMs: 0, lastEmit: 0 };
+    this._fps = 0;
+    this._rtt = 0;
+    this._postedAt = 0;
+    this._depthLogged = false;
+    this._loggedDepthStatus = '';
   }
 
   /* ---------------- lifecycle ---------------- */
@@ -69,6 +78,7 @@ export class WorldScanner {
     this.camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.02, 300);
     this.camera.position.set(0, 1.6, 0);
     this.cloudMat = new THREE.PointsMaterial({ size: 0.03, vertexColors: true, sizeAttenuation: true });
+    clampPointSize(this.cloudMat);
 
     this.worker = new Worker('/js/world-fuse-worker.js');
     this.worker.postMessage({ type: 'init', cap: CAP });
@@ -92,9 +102,14 @@ export class WorldScanner {
     // a plain DOM timer keeps firing even if rAF dies — resurrect the loop
     this._watchdog = setInterval(() => {
       if (this._stopped) return;
-      if (performance.now() - this._lastTick > 2200) {
+      // rAF is legitimately paused while backgrounded — restarting can't help
+      if (document.visibilityState === 'hidden') { this._lastTick = performance.now(); return; }
+      const stall = performance.now() - this._lastTick;
+      if (stall > 2200) {
         this._recoveries++;
         this._lastErr = null;
+        tlog('watchdog-recover', { n: this._recoveries, stall: Math.round(stall), pts: this.count, state: this.state });
+        flush();
         try {
           this.renderer.setAnimationLoop(null);
           this.renderer.setAnimationLoop(this._loop);
@@ -140,6 +155,15 @@ export class WorldScanner {
     this._startedAt = performance.now();
     this._lastCapture = this._startedAt + WARMUP_MS - CAPTURE_MS;
     this.buildScanHUD();
+
+    let depthUsage = null, depthFormat = null;
+    try { depthUsage = session.depthUsage; depthFormat = session.depthDataFormat; } catch (e) { /* not exposed */ }
+    tlog('xr-session', {
+      features: session.enabledFeatures ? Array.from(session.enabledFeatures) : null,
+      depthUsage, depthFormat,
+      glBinding: !!this.glBinding,
+    });
+    flush();
   }
 
   /* ---------------- worker plumbing ---------------- */
@@ -147,11 +171,17 @@ export class WorldScanner {
     if (this._stopped) return;
     if (m.type === 'points') {
       this._workerBusy = false;
+      if (this._postedAt) { this._rtt = Math.round(performance.now() - this._postedAt); this._postedAt = 0; }
       this.count = m.total;
       this._ground = m.ground;
       this._min = m.min;
       this._max = m.max;
-      if (m.n > 0) this.appendPoints(new Float32Array(m.pos), new Uint8Array(m.col), m.n);
+      if (m.n > 0) {
+        const a0 = performance.now();
+        this.appendPoints(new Float32Array(m.pos), new Uint8Array(m.col), m.n);
+        const aMs = performance.now() - a0;
+        if (aMs > this._stats.appendMs) this._stats.appendMs = aMs;
+      }
       if (this._pendingBatches > 0 && --this._pendingBatches === 0 && this.state === 'generating') {
         this.state = 'review';
         this.showSaveDialog();
@@ -165,6 +195,8 @@ export class WorldScanner {
     } else if (m.type === 'error') {
       this._workerBusy = false;
       this._lastErr = 'worker: ' + m.message.slice(0, 50);
+      tlog('worker-error', { msg: m.message.slice(0, 200) });
+      flush();
     }
   }
 
@@ -204,13 +236,37 @@ export class WorldScanner {
 
   /* ---------------- per-frame ---------------- */
   tick(time, frame) {
-    this._lastTick = performance.now();
+    const now = performance.now();
+    const gap = now - this._lastTick;
+    this._lastTick = now;
     if (this._stopped) return;
     try {
+      const st = this._stats;
+      st.frames++;
+      if (gap > st.maxGap) st.maxGap = gap;
+      if (this.state === 'scanning' && now - st.lastEmit > 1000) {
+        this._fps = st.lastEmit ? Math.round(st.frames * 1000 / (now - st.lastEmit)) : 0;
+        if (st.lastEmit) {
+          tlog('scan1s', {
+            fps: this._fps, maxGap: Math.round(st.maxGap),
+            capMs: Math.round(st.capMs), appendMs: Math.round(st.appendMs),
+            rtt: this._rtt, pts: this.count, pages: this.pages.length,
+            depth: this._depthStatus.slice(0, 40),
+            color: this.hasColor ? 1 : 0, colorOff: this.colorDisabled ? 1 : 0,
+            rec: this._recoveries, err: this._lastErr,
+            heap: performance.memory ? (performance.memory.usedJSHeapSize / 1048576) | 0 : undefined,
+          });
+        }
+        st.lastEmit = now;
+        st.frames = 0; st.maxGap = 0; st.capMs = 0; st.appendMs = 0;
+      }
+
       if (this.state === 'scanning' && frame &&
           time - this._lastCapture >= CAPTURE_MS && !this._workerBusy && this.count < CAP) {
         this._lastCapture = time;
         this.captureFrame(frame);
+        const capMs = performance.now() - now;
+        if (capMs > st.capMs) st.capMs = capMs;
       }
 
       if (this.state === 'scanning' && time - (this._lastHud || 0) > 250) {
@@ -238,10 +294,11 @@ export class WorldScanner {
 
     let depth = null;
     try { depth = frame.getDepthInformation(view); }
-    catch (e) { this._depthStatus = 'depth err: ' + e.message.slice(0, 40); return; }
-    if (!depth) { this._depthStatus = 'no depth yet — keep moving'; return; }
+    catch (e) { this._depthStatus = 'depth err: ' + e.message.slice(0, 40); this.logDepthStatus(); return; }
+    if (!depth) { this._depthStatus = 'no depth yet — keep moving'; this.logDepthStatus(); return; }
     if (!depth.data || !depth.normDepthBufferFromNormView) {
       this._depthStatus = 'no raw depth buffer on this device';
+      this.logDepthStatus();
       return;
     }
 
@@ -249,8 +306,13 @@ export class WorldScanner {
     let isFloat;
     if (depth.data.byteLength === n * 4) isFloat = true;
     else if (depth.data.byteLength === n * 2) isFloat = false;
-    else { this._depthStatus = `odd depth layout ${depth.width}×${depth.height}/${depth.data.byteLength}b`; return; }
+    else { this._depthStatus = `odd depth layout ${depth.width}×${depth.height}/${depth.data.byteLength}b`; this.logDepthStatus(); return; }
     this._depthStatus = `depth ${depth.width}×${depth.height} ok`;
+    if (!this._depthLogged) {
+      this._depthLogged = true;
+      tlog('depth-ok', { w: depth.width, h: depth.height, isFloat, scale: depth.rawValueToMeters });
+      flush();
+    }
 
     // occasional, timed camera color grab; give up on it if this device is slow
     let cam = null;
@@ -259,13 +321,18 @@ export class WorldScanner {
       this._lastCamGrab = t0;
       try {
         const pix = this.grabCameraPixels(view.camera);
-        if (performance.now() - t0 > 30) this.colorDisabled = true;
+        const grabMs = performance.now() - t0;
+        if (grabMs > 30) {
+          this.colorDisabled = true;
+          tlog('color-disabled', { why: 'slow readPixels', ms: Math.round(grabMs) });
+        }
         if (pix) {
           cam = { buf: pix.slice().buffer, w: CAM_W, h: CAM_H };
           this.hasColor = true;
         }
       } catch (e) {
         this.colorDisabled = true;
+        tlog('color-disabled', { why: String(e.message || e).slice(0, 100) });
       }
     }
 
@@ -282,7 +349,15 @@ export class WorldScanner {
       cam,
     };
     this._workerBusy = true;
+    this._postedAt = performance.now();
     this.worker.postMessage(msg, cam ? [msg.buf, cam.buf] : [msg.buf]);
+  }
+
+  /** log depth-status transitions (once per distinct status, not per frame) */
+  logDepthStatus() {
+    if (this._depthStatus === this._loggedDepthStatus) return;
+    this._loggedDepthStatus = this._depthStatus;
+    tlog('depth-status', { s: this._depthStatus.slice(0, 80) });
   }
 
   /* ---------------- raw camera color grab ---------------- */
@@ -393,7 +468,7 @@ export class WorldScanner {
     q('scan-cap-fill').style.width = Math.min(100, (this.count / CAP) * 100) + '%';
     q('scan-debug').textContent = this._lastErr
       ? 'ERR ' + this._lastErr
-      : `${this._depthStatus} · ${this.hasColor ? 'color ✓' : 'tint'}${this._recoveries ? ' · rec×' + this._recoveries : ''}`;
+      : `${this._fps}fps · ${this._depthStatus} · ${this.hasColor ? 'color ✓' : 'tint'}${this._recoveries ? ' · rec×' + this._recoveries : ''}`;
     if (this.count >= CAP) this.setHint('Memory full — finish and save your world.');
     else if (this.count === 0 && performance.now() - this._startedAt > 6000 && !this._zeroWarned) {
       this._zeroWarned = true;
@@ -408,6 +483,8 @@ export class WorldScanner {
   async enterReview() {
     if (this.state !== 'scanning' && this.state !== 'boot') return;
     this.state = 'review';
+    tlog('review', { pts: this.count });
+    flush();
     const session = this.session;
     this.session = null;
     if (session) { try { await session.end(); } catch (e) { /* already gone */ } }
@@ -456,14 +533,18 @@ export class WorldScanner {
       this.state = 'saving';
       this.hud.querySelector('#save-progress').classList.remove('hidden');
       try {
+        tlog('save-start', { pts: this.count });
         await this.upload(name, (f) => {
           this.hud.querySelector('#save-progress-fill').style.width = Math.round(f * 100) + '%';
         });
         this.state = 'done';
+        tlog('save-done', { pts: this.count });
         this.onSaved?.({ name, points: this.count });
         this.stop();
       } catch (err) {
         this.state = 'review';
+        tlog('save-failed', { msg: String(err.message).slice(0, 200) });
+        flush();
         errEl.textContent = err.message;
         errEl.classList.remove('hidden');
         saveBtn.disabled = false;
@@ -607,6 +688,8 @@ export class WorldScanner {
   stop() {
     if (this._stopped) return;
     this._stopped = true;
+    tlog('scanner-stop', { state: this.state, pts: this.count, rec: this._recoveries });
+    flush();
     clearInterval(this._watchdog);
     this.worker?.terminate();
     this.renderer.setAnimationLoop(null);
@@ -619,6 +702,21 @@ export class WorldScanner {
     this.container.innerHTML = '';
     this.onExit?.();
   }
+}
+
+/**
+ * Cap the screen-space size of attenuated points. Without this, points close
+ * to the camera rasterize as ~100px quads on a phone XR framebuffer; a dense
+ * near cloud then costs hundreds of millions of overdrawn pixels per frame,
+ * which stalls mobile GPUs to a slideshow (reads as the whole app freezing).
+ */
+export function clampPointSize(material, maxPx = 7.0) {
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <logdepthbuf_vertex>',
+      `gl_PointSize = clamp( gl_PointSize, 1.0, ${maxPx.toFixed(1)} );\n\t#include <logdepthbuf_vertex>`
+    );
+  };
 }
 
 function mulberry32(seed) {

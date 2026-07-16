@@ -3,4 +3,5 @@ node_modules/
 *.db-shm
 *.db-wal
 worlds/
+client-log.jsonl
 .env

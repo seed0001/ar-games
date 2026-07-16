@@ -1,3 +1,4 @@
+import { tlog, flush } from './telemetry.js';
 import { ShooterGame, arSupported } from './xr-shooter.js';
 import { WorldScanner } from './world-scanner.js';
 import { WorldExplorer } from './world-explorer.js';
@@ -228,6 +229,7 @@ async function launchScanner(modeDef) {
 
   freshBtn.addEventListener('click', async () => {
     freshBtn.disabled = true;
+    tlog('scanner-launch', { xr });
     try {
       game = new WorldScanner({
         container: $('gl-container'),
@@ -241,6 +243,8 @@ async function launchScanner(modeDef) {
       $('intro').classList.add('hidden');
     } catch (err) {
       console.error(err);
+      tlog('scanner-start-failed', { msg: String(err.message).slice(0, 200) });
+      flush();
       toast('Could not start the scanner: ' + err.message, 5000);
       game = null;
       show('hub');
