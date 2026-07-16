@@ -14,9 +14,9 @@ import * as THREE from 'three';
 import { VOXEL, encodePoints } from './world-format.js';
 
 const CAP = 1_500_000;               // max points per world (~15 MB binary)
-const CAPTURE_MS = 170;              // depth fuse interval
+const CAPTURE_MS = 170;              // initial depth fuse interval (self-throttles)
+const CAM_GRAB_MS = 450;             // camera readPixels stalls the GPU — keep it rare
 const DEPTH_MIN = 0.25, DEPTH_MAX = 6.0;
-const GRID_W = 72, GRID_H = 54;      // depth samples per fused frame
 const CAM_W = 160, CAM_H = 120;      // downscaled camera color grab
 const CHUNK_BYTES = 4 * 1024 * 1024; // upload chunk size
 
@@ -66,7 +66,12 @@ export class WorldScanner {
     this.invProj = new THREE.Matrix4();
     this.viewMat = new THREE.Matrix4();
     this.hasColor = false;
+    this.camPix = null;
+    this.captureInterval = CAPTURE_MS;
+    this._phase = 0;
+    this._depthStatus = 'waiting for depth…';
     this._lastCapture = 0;
+    this._lastCamGrab = 0;
     this._startedAt = 0;
     this._stopped = false;
   }
@@ -152,7 +157,7 @@ export class WorldScanner {
   tick(time, frame) {
     if (this._stopped) return;
 
-    if (this.state === 'scanning' && frame && time - this._lastCapture >= CAPTURE_MS && this.count < CAP) {
+    if (this.state === 'scanning' && frame && time - this._lastCapture >= this.captureInterval && this.count < CAP) {
       this._lastCapture = time;
       try { this.captureFrame(frame); } catch (e) { /* single bad frame — keep scanning */ }
     }
@@ -174,53 +179,108 @@ export class WorldScanner {
     const refSpace = this.renderer.xr.getReferenceSpace();
     if (!refSpace) return;
     const pose = frame.getViewerPose(refSpace);
-    if (!pose) return;
+    if (!pose) { this._depthStatus = 'tracking…'; return; }
     const view = pose.views[0];
 
     let depth = null;
-    try { depth = frame.getDepthInformation(view); } catch (e) { return; }
-    if (!depth || !depth.getDepthInMeters) return;
+    try { depth = frame.getDepthInformation(view); }
+    catch (e) { this._depthStatus = 'depth err: ' + e.message.slice(0, 40); return; }
+    if (!depth) { this._depthStatus = 'no depth yet — keep moving'; return; }
 
-    let camPix = null;
-    if (this.glBinding && view.camera) {
-      camPix = this.grabCameraPixels(view.camera);
-      if (camPix) this.hasColor = true;
+    const t0 = performance.now();
+
+    if (this.glBinding && view.camera && t0 - this._lastCamGrab > CAM_GRAB_MS) {
+      this._lastCamGrab = t0;
+      const pix = this.grabCameraPixels(view.camera);
+      if (pix) { this.camPix = pix; this.hasColor = true; }
     }
 
     this.invProj.fromArray(view.projectionMatrix).invert();
     this.viewMat.fromArray(view.transform.matrix);
-    const v3 = this.tmpV;
     const before = this.count;
 
-    for (let iy = 0; iy < GRID_H; iy++) {
-      const v = (iy + 0.5) / GRID_H;
-      for (let ix = 0; ix < GRID_W; ix++) {
-        const u = (ix + 0.5) / GRID_W;
+    if (depth.data && depth.normDepthBufferFromNormView) this.fuseDepthBuffer(depth);
+    else if (depth.getDepthInMeters) this.fuseDepthSlow(depth);
+    else { this._depthStatus = 'unsupported depth format'; return; }
+
+    this.flushGeometry(before);
+
+    // self-throttle: a slow device spaces captures out instead of locking up
+    const ms = performance.now() - t0;
+    if (ms > 34) this.captureInterval = Math.min(700, this.captureInterval * 1.5);
+    else if (ms < 12 && this.captureInterval > CAPTURE_MS) {
+      this.captureInterval = Math.max(CAPTURE_MS, this.captureInterval * 0.8);
+    }
+  }
+
+  /** Fast path: index the raw CPU depth buffer directly — no per-pixel API calls. */
+  fuseDepthBuffer(depth) {
+    const w = depth.width, h = depth.height, n = w * h;
+    let raw, scale;
+    if (depth.data.byteLength === n * 4) { raw = new Float32Array(depth.data); scale = depth.rawValueToMeters || 1; }
+    else if (depth.data.byteLength === n * 2) { raw = new Uint16Array(depth.data); scale = depth.rawValueToMeters || 0.001; }
+    else { this._depthStatus = `odd depth layout ${w}×${h}/${depth.data.byteLength}b`; return; }
+    this._depthStatus = `depth ${w}×${h} ok`;
+
+    // maps depth-buffer UV → normalized view UV (handles the portrait rotation)
+    const inv = depth.normDepthBufferFromNormView.inverse.matrix;
+
+    const sx = Math.max(1, Math.round(w / 96));
+    const sy = Math.max(1, Math.round(h / 72)) * 2;   // every other row,
+    this._phase = 1 - this._phase;                     // alternating each tick
+    const y0 = this._phase * (sy >> 1);
+
+    for (let py = y0; py < h; py += sy) {
+      const dv = (py + 0.5) / h;
+      const row = py * w;
+      for (let px = 0; px < w; px += sx) {
+        const d = raw[row + px] * scale;
+        if (!(d >= DEPTH_MIN && d <= DEPTH_MAX)) continue;
+        const du = (px + 0.5) / w;
+        const u = inv[0] * du + inv[4] * dv + inv[12];
+        const v = inv[1] * du + inv[5] * dv + inv[13];
+        if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+        this.fusePoint(u, v, d);
+        if (this.count >= CAP) return;
+      }
+    }
+  }
+
+  /** Fallback when raw buffer access is unavailable: sparse getDepthInMeters grid. */
+  fuseDepthSlow(depth) {
+    this._depthStatus = 'depth slow-path';
+    for (let iy = 0; iy < 30; iy++) {
+      const v = (iy + 0.5) / 30;
+      for (let ix = 0; ix < 40; ix++) {
+        const u = (ix + 0.5) / 40;
         let d;
         try { d = depth.getDepthInMeters(u, v); } catch (e) { continue; }
         if (!(d >= DEPTH_MIN && d <= DEPTH_MAX)) continue;
-
-        // unproject (u,v,depth) through this view into world space
-        v3.set(u * 2 - 1, 1 - v * 2, 0.5).applyMatrix4(this.invProj);
-        if (v3.z > -1e-6) continue;
-        v3.multiplyScalar(d / -v3.z).applyMatrix4(this.viewMat);
-
-        let r, g, b;
-        if (camPix) {
-          const px = Math.min(CAM_W - 1, (u * CAM_W) | 0);
-          const py = Math.min(CAM_H - 1, ((1 - v) * CAM_H) | 0);
-          const o = (py * CAM_W + px) * 4;
-          r = camPix[o]; g = camPix[o + 1]; b = camPix[o + 2];
-        } else {
-          const t = Math.max(0, Math.min(1, (v3.y + 0.6) / 3.6));
-          r = 16 + t * 180; g = 60 + t * 180; b = 120 + t * 135;
-        }
-        this.addPoint(v3.x, v3.y, v3.z, r, g, b);
-        if (this.count >= CAP) break;
+        this.fusePoint(u, v, d);
+        if (this.count >= CAP) return;
       }
-      if (this.count >= CAP) break;
     }
-    this.flushGeometry(before);
+  }
+
+  /** Unproject one (viewU, viewV, metres) sample into world space and fuse it. */
+  fusePoint(u, v, d) {
+    const v3 = this.tmpV;
+    v3.set(u * 2 - 1, 1 - v * 2, 0.5).applyMatrix4(this.invProj);
+    if (v3.z > -1e-6) return;
+    v3.multiplyScalar(d / -v3.z).applyMatrix4(this.viewMat);
+
+    let r, g, b;
+    const camPix = this.camPix;
+    if (camPix) {
+      const px = Math.min(CAM_W - 1, (u * CAM_W) | 0);
+      const py = Math.min(CAM_H - 1, ((1 - v) * CAM_H) | 0);
+      const o = (py * CAM_W + px) * 4;
+      r = camPix[o]; g = camPix[o + 1]; b = camPix[o + 2];
+    } else {
+      const t = Math.max(0, Math.min(1, (v3.y + 0.6) / 3.6));
+      r = 16 + t * 180; g = 60 + t * 180; b = 120 + t * 135;
+    }
+    this.addPoint(v3.x, v3.y, v3.z, r, g, b);
   }
 
   addPoint(x, y, z, r, g, b) {
@@ -330,6 +390,7 @@ export class WorldScanner {
         <span class="scan-stat" id="scan-time">0:00</span>
       </div>
       <div class="scan-cap"><div class="scan-cap-fill" id="scan-cap-fill"></div></div>
+      <div class="scan-debug" id="scan-debug"></div>
       <div class="scan-hint" id="scan-hint">Walk slowly and sweep the phone across ground, trees and walls — the map paints in as you go.</div>
       <div class="scan-actions">
         <button class="btn-primary" id="scan-done">✓ Finish &amp; save</button>
@@ -359,8 +420,13 @@ export class WorldScanner {
     const s = Math.floor((performance.now() - this._startedAt) / 1000);
     q('scan-time').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
     q('scan-cap-fill').style.width = Math.min(100, (this.count / CAP) * 100) + '%';
+    q('scan-debug').textContent =
+      `${this._depthStatus} · ${this.hasColor ? 'color ✓' : 'tint'} · ${Math.round(this.captureInterval)}ms`;
     if (this.count >= CAP) this.setHint('Memory full — finish and save your world.');
-    else if (!this.hasColor && this.count > 4000 && !this._colorWarned) {
+    else if (this.count === 0 && performance.now() - this._startedAt > 6000 && !this._zeroWarned) {
+      this._zeroWarned = true;
+      this.setHint('No 3D data yet — aim at the ground 1–3 m ahead and pan slowly.');
+    } else if (!this.hasColor && this.count > 4000 && !this._colorWarned) {
       this._colorWarned = true;
       this.setHint('No camera-color access on this phone — scanning in hologram tint instead.');
     }

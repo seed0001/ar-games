@@ -551,6 +551,19 @@ body { overflow: hidden; }
   background: linear-gradient(90deg, var(--accent2), var(--accent1));
   transition: width 0.4s;
 }
+.scan-debug {
+  position: absolute;
+  top: calc(max(14px, env(safe-area-inset-top)) + 52px);
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: var(--dim);
+  background: rgba(8, 10, 18, 0.6);
+  border-radius: 999px;
+  padding: 3px 10px;
+  white-space: nowrap;
+  pointer-events: none;
+}
 .scan-hint {
   position: absolute;
   bottom: calc(max(20px, env(safe-area-inset-bottom)) + 74px);
