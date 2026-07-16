@@ -42,6 +42,11 @@ export class WorldScanner {
     this._max = [0, 0, 0];
 
     this.pages = [];
+    // The worker emits one mesh per 32 cm block; we batch every 8³ blocks
+    // (~2.5 m) into a single tile geometry so the whole scan is a few dozen
+    // draw calls instead of thousands.
+    this.tiles = new Map();        // tileKey -> { geo, mesh, blocks: Map(blockKey -> {pos,col,conf}) }
+    this._blockCount = 0;
     this.invProj = new THREE.Matrix4();
     this.hasColor = false;
     this.colorDisabled = false;
@@ -81,6 +86,7 @@ export class WorldScanner {
     this.camera.position.set(0, 1.6, 0);
     this.cloudMat = new THREE.PointsMaterial({ size: 0.03, vertexColors: true, sizeAttenuation: true });
     clampPointSize(this.cloudMat);
+    this.meshMat = buildMeshMaterial();
 
     this.worker = new Worker('/js/world-fuse-worker.js');
     this.worker.postMessage({ type: 'init', cap: CAP });
@@ -187,6 +193,10 @@ export class WorldScanner {
   /* ---------------- worker plumbing ---------------- */
   onWorkerMessage(m) {
     if (this._stopped) return;
+    if (m.type === 'mesh') {
+      this.applyMesh(m);
+      return;
+    }
     if (m.type === 'points') {
       this._workerBusy = false;
       if (this._postedAt) { this._rtt = Math.round(performance.now() - this._postedAt); this._postedAt = 0; }
@@ -194,12 +204,8 @@ export class WorldScanner {
       this._ground = m.ground;
       this._min = m.min;
       this._max = m.max;
-      if (m.n > 0) {
-        const a0 = performance.now();
-        this.appendPoints(new Float32Array(m.pos), new Uint8Array(m.col), m.n);
-        const aMs = performance.now() - a0;
-        if (aMs > this._stats.appendMs) this._stats.appendMs = aMs;
-      }
+      // point deltas are ignored for rendering now — the live view is the mesh
+      // (the worker still keeps the point store for save/explore)
       if (this._pendingBatches > 0 && --this._pendingBatches === 0 && this.state === 'generating') {
         this.state = 'review';
         this.showSaveDialog();
@@ -252,6 +258,65 @@ export class WorldScanner {
     return page;
   }
 
+  /** fold one block's mesh into its tile, then rebuild that tile's geometry */
+  applyMesh(m) {
+    const tkx = m.bx >> 3, tky = m.by >> 3, tkz = m.bz >> 3;   // 8 blocks per tile
+    const tileKey = ((tkx + 512) * 1024 + (tky + 512)) * 1024 + (tkz + 512);
+    let tile = this.tiles.get(tileKey);
+
+    if (m.empty) {
+      if (tile && tile.blocks.delete(m.key)) {
+        this._blockCount--;
+        if (tile.blocks.size === 0) {
+          this.scene.remove(tile.mesh);
+          tile.geo.dispose();
+          this.tiles.delete(tileKey);
+        } else {
+          this.rebuildTile(tile);
+        }
+      }
+      return;
+    }
+
+    if (!tile) {
+      const geo = new THREE.BufferGeometry();
+      const mesh = new THREE.Mesh(geo, this.meshMat);
+      mesh.frustumCulled = true;      // only visible tiles cost draw calls
+      this.scene.add(mesh);
+      tile = { geo, mesh, blocks: new Map() };
+      this.tiles.set(tileKey, tile);
+    }
+    if (!tile.blocks.has(m.key)) this._blockCount++;
+    tile.blocks.set(m.key, {
+      pos: new Float32Array(m.pos),
+      col: new Uint8Array(m.col),
+      conf: new Uint8Array(m.conf),
+    });
+    this.rebuildTile(tile);
+  }
+
+  /** concatenate a tile's member blocks into one geometry (one draw call) */
+  rebuildTile(tile) {
+    let nv = 0;
+    for (const b of tile.blocks.values()) nv += b.pos.length / 3;
+    const pos = new Float32Array(nv * 3);
+    const col = new Uint8Array(nv * 3);
+    const conf = new Uint8Array(nv);
+    let o = 0;
+    for (const b of tile.blocks.values()) {
+      pos.set(b.pos, o * 3);
+      col.set(b.col, o * 3);
+      conf.set(b.conf, o);
+      o += b.pos.length / 3;
+    }
+    const geo = tile.geo;
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('acolor', new THREE.BufferAttribute(col, 3, true));
+    geo.setAttribute('confidence', new THREE.BufferAttribute(conf, 1, true));
+    geo.computeBoundingSphere();
+    tile.tris = nv / 3;
+  }
+
   /* ---------------- per-frame ---------------- */
   tick(time, frame) {
     const now = performance.now();
@@ -268,7 +333,10 @@ export class WorldScanner {
           tlog('scan1s', {
             fps: this._fps, maxGap: Math.round(st.maxGap),
             capMs: Math.round(st.capMs), appendMs: Math.round(st.appendMs),
-            rtt: this._rtt, pts: this.count, pages: this.pages.length,
+            rtt: this._rtt, pts: this.count,
+            blocks: this._blockCount, tiles: this.tiles.size,
+            calls: this.renderer.info.render.calls,
+            tris: this.renderer.info.render.triangles,
             depth: this._depthStatus.slice(0, 40),
             color: this.hasColor ? 1 : 0, colorOff: this.colorDisabled ? 1 : 0,
             rec: this._recoveries, err: this._lastErr,
@@ -499,7 +567,7 @@ export class WorldScanner {
     q('scan-cap-fill').style.width = Math.min(100, (this.count / CAP) * 100) + '%';
     q('scan-debug').textContent = this._lastErr
       ? 'ERR ' + this._lastErr
-      : `${this._fps}fps · ${this._depthStatus} · ${this.hasColor ? 'color ✓' : 'tint'}${this._recoveries ? ' · rec×' + this._recoveries : ''}`;
+      : `${this._fps}fps · ${this._depthStatus} · ${this._blockCount} blk · ${this.hasColor ? 'color ✓' : 'tint'}${this._recoveries ? ' · rec×' + this._recoveries : ''}`;
     if (this.count >= CAP) this.setHint('Memory full — finish and save your world.');
     else if (this.count === 0 && performance.now() - this._startedAt > 6000 && !this._zeroWarned) {
       this._zeroWarned = true;
@@ -728,7 +796,10 @@ export class WorldScanner {
     window.removeEventListener('resize', this._onResize);
     this.hud.innerHTML = '';
     for (const page of this.pages) page.geo.dispose();
+    for (const tile of this.tiles.values()) tile.geo.dispose();
+    this.tiles.clear();
     this.cloudMat.dispose();
+    this.meshMat.dispose();
     this.renderer.dispose();
     this.container.innerHTML = '';
     this.onExit?.();
@@ -748,6 +819,65 @@ export function clampPointSize(material, maxPx = 7.0) {
       `gl_PointSize = clamp( gl_PointSize, 1.0, ${maxPx.toFixed(1)} );\n\t#include <logdepthbuf_vertex>`
     );
   };
+}
+
+/**
+ * The live-scan surface material. Every triangle's edges always draw as a
+ * glowing wireframe "framework"; each vertex also carries a confidence value
+ * (how many times that spot has been observed) and the solid, shaded face
+ * fill only appears — via alpha-test, so no transparency sorting — once
+ * confidence crosses a threshold. Revisiting a spot therefore fills the
+ * framework in with real color. Flat normals come from screen-space
+ * derivatives, so the mesh needs no normal attribute.
+ */
+function buildMeshMaterial() {
+  return new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    side: THREE.DoubleSide,
+    uniforms: { lightDir: { value: new THREE.Vector3(0.4, 1.0, 0.5).normalize() } },
+    vertexShader: `
+      in vec3 acolor;
+      in float confidence;
+      out vec3 vColor;
+      out float vConf;
+      out vec3 vWorld;
+      out vec3 vBary;
+      void main() {
+        vColor = acolor;
+        vConf = confidence;
+        int m = gl_VertexID % 3;
+        vBary = vec3(m == 0 ? 1.0 : 0.0, m == 1 ? 1.0 : 0.0, m == 2 ? 1.0 : 0.0);
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorld = wp.xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      precision highp float;
+      in vec3 vColor;
+      in float vConf;
+      in vec3 vWorld;
+      in vec3 vBary;
+      uniform vec3 lightDir;
+      out vec4 fragColor;
+      void main() {
+        vec3 n = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+        if (!gl_FrontFacing) n = -n;
+        float lam = 0.35 + 0.65 * max(0.0, dot(n, lightDir));
+        vec3 solid = vColor * lam;
+
+        vec3 dw = fwidth(vBary);
+        vec3 fw = smoothstep(vec3(0.0), dw * 1.5, vBary);
+        float interior = min(min(fw.x, fw.y), fw.z);   // 1 inside face, 0 on edge
+        float edge = 1.0 - interior;
+
+        float faceAlpha = smoothstep(0.12, 0.55, vConf);
+        float a = max(edge, faceAlpha);
+        if (a < 0.5) discard;                          // low-confidence faces stay hollow
+
+        vec3 wire = vColor * 0.5 + vec3(0.25, 0.6, 0.85) * 0.6;
+        fragColor = vec4(mix(wire, solid, faceAlpha), 1.0);
+      }`,
+  });
 }
 
 function mulberry32(seed) {
