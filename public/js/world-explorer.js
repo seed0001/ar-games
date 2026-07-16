@@ -7,11 +7,81 @@
  *          floor and you walk around it like a model railway.
  */
 import * as THREE from 'three';
-import { decodePoints } from './world-format.js';
+import { decodePoints, VOXEL } from './world-format.js';
 import { clampPointSize } from './world-scanner.js';
 
 const EYE = 1.7;
 const DIORAMA_SIZE = 1.4; // metres, longest side when placed on your floor
+const MAX_SOLID_FACES = 1_500_000; // beyond this fall back to the point cloud
+
+/**
+ * Turn the voxel-gridded point cloud into a connected surface: every stored
+ * point is a filled 4 cm cell, and we emit a shaded quad for each cell face
+ * that has no occupied neighbor. Floors and walls read as solid planes
+ * instead of dot sprays. Returns null if the world is too big to mesh.
+ */
+function buildVoxelMesh(positions, colors, count) {
+  const inv = 1 / VOXEL, H = VOXEL / 2;
+  const key = (qx, qy, qz) => (qx + 32768) * 4294967296 + (qy + 32768) * 65536 + (qz + 32768);
+  const occupied = new Set();
+  const q = new Int32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const p = i * 3;
+    q[p]     = Math.round(positions[p] * inv);
+    q[p + 1] = Math.round(positions[p + 1] * inv);
+    q[p + 2] = Math.round(positions[p + 2] * inv);
+    occupied.add(key(q[p], q[p + 1], q[p + 2]));
+  }
+
+  // per-face: outward direction, baked shade, 4 corners (CCW from outside)
+  const DIRS = [
+    { d: [1, 0, 0],  s: 0.80, c: [[H, -H, -H], [H, H, -H], [H, H, H], [H, -H, H]] },
+    { d: [-1, 0, 0], s: 0.80, c: [[-H, -H, H], [-H, H, H], [-H, H, -H], [-H, -H, -H]] },
+    { d: [0, 1, 0],  s: 1.00, c: [[-H, H, -H], [-H, H, H], [H, H, H], [H, H, -H]] },
+    { d: [0, -1, 0], s: 0.55, c: [[-H, -H, H], [-H, -H, -H], [H, -H, -H], [H, -H, H]] },
+    { d: [0, 0, 1],  s: 0.68, c: [[-H, -H, H], [H, -H, H], [H, H, H], [-H, H, H]] },
+    { d: [0, 0, -1], s: 0.68, c: [[H, -H, -H], [-H, -H, -H], [-H, H, -H], [H, H, -H]] },
+  ];
+
+  let faces = 0;
+  for (let i = 0; i < count; i++) {
+    const p = i * 3;
+    for (const f of DIRS) {
+      if (!occupied.has(key(q[p] + f.d[0], q[p + 1] + f.d[1], q[p + 2] + f.d[2]))) faces++;
+    }
+  }
+  if (faces === 0 || faces > MAX_SOLID_FACES) return null;
+
+  const vp = new Float32Array(faces * 4 * 3);
+  const vc = new Uint8Array(faces * 4 * 3);
+  const idx = new Uint32Array(faces * 6);
+  let v = 0, ii = 0;
+  for (let i = 0; i < count; i++) {
+    const p = i * 3;
+    const cx = q[p] * VOXEL, cy = q[p + 1] * VOXEL, cz = q[p + 2] * VOXEL;
+    const r = colors[p], g = colors[p + 1], b = colors[p + 2];
+    for (const f of DIRS) {
+      if (occupied.has(key(q[p] + f.d[0], q[p + 1] + f.d[1], q[p + 2] + f.d[2]))) continue;
+      const base = v;
+      for (const c of f.c) {
+        const o = v * 3;
+        vp[o] = cx + c[0]; vp[o + 1] = cy + c[1]; vp[o + 2] = cz + c[2];
+        vc[o] = r * f.s; vc[o + 1] = g * f.s; vc[o + 2] = b * f.s;
+        v++;
+      }
+      idx[ii++] = base;     idx[ii++] = base + 1; idx[ii++] = base + 2;
+      idx[ii++] = base;     idx[ii++] = base + 2; idx[ii++] = base + 3;
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(vp, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(vc, 3, true));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  mesh.frustumCulled = false;
+  return mesh;
+}
 
 export class WorldExplorer {
   constructor({ container, hud, world, xr, onExit }) {
@@ -56,6 +126,12 @@ export class WorldExplorer {
     this.cloud.frustumCulled = false;
     this.worldGroup = new THREE.Group();
     this.worldGroup.add(this.cloud);
+
+    this.solid = buildVoxelMesh(positions, colors, count);
+    if (this.solid) {
+      this.worldGroup.add(this.solid);
+      this.cloud.visible = false;   // solid is the default view when available
+    }
     this.scene.add(this.worldGroup);
 
     geo.computeBoundingBox();
@@ -123,10 +199,11 @@ export class WorldExplorer {
 
   buildHUD() {
     const arBtn = this.xr ? '<button class="btn-ghost" id="exp-ar">◈ diorama AR</button>' : '';
+    const modeBtn = this.solid ? '<button class="btn-ghost" id="exp-mode">· dots</button>' : '';
     this.hud.innerHTML = `
       <div class="exp-top">
         <span class="exp-title">🗺️ ${esc(this.world.name)} <em>by ${esc(this.world.username)}</em></span>
-        <span>${arBtn}<button class="btn-ghost" id="exp-exit">✖ leave</button></span>
+        <span>${modeBtn}${arBtn}<button class="btn-ghost" id="exp-exit">✖ leave</button></span>
       </div>
       <div class="scan-hint" id="exp-hint">${this.isTouch
         ? 'Left thumb = walk · drag right side = look'
@@ -138,6 +215,13 @@ export class WorldExplorer {
           <button class="fly-btn" id="fly-down">▼</button>
         </div>` : ''}`;
     this.hud.querySelector('#exp-exit').addEventListener('click', () => this.stop());
+    const mode = this.hud.querySelector('#exp-mode');
+    if (mode) mode.addEventListener('click', () => {
+      const solidOn = !this.solid.visible;
+      this.solid.visible = solidOn;
+      this.cloud.visible = !solidOn;
+      mode.textContent = solidOn ? '· dots' : '◼ solid';
+    });
     const ar = this.hud.querySelector('#exp-ar');
     if (ar) ar.addEventListener('click', () => this.enterDiorama().catch((err) => {
       this.setHint('AR failed: ' + err.message);
@@ -370,6 +454,7 @@ export class WorldExplorer {
     this.hud.innerHTML = '';
     this.cloud?.geometry.dispose();
     this.material?.dispose();
+    if (this.solid) { this.solid.geometry.dispose(); this.solid.material.dispose(); }
     this.renderer.dispose();
     this.container.innerHTML = '';
     this.onExit?.();
