@@ -71,7 +71,12 @@ function auth(required = true) {
     const token = req.cookies.token;
     if (token) {
       try {
-        req.user = jwt.verify(token, SECRET);
+        const payload = jwt.verify(token, SECRET);
+        // the DB may have been reset since the cookie was issued — make sure
+        // the user still exists, or inserts referencing user_id will 500
+        const row = db.prepare('SELECT id, username FROM users WHERE id = ?').get(payload.id);
+        if (row) req.user = { id: row.id, username: row.username };
+        else res.clearCookie('token');
       } catch (e) {
         /* invalid/expired token — treat as logged out */
       }
