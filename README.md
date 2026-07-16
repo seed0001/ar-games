@@ -56,9 +56,11 @@ public/
   js/xr-shooter.js      Cover Fire: WebXR session + hit-test floor placement,
                         arena, enemy AI with line-of-sight checks, heat weapon,
                         waves, procedural sound effects, desktop simulator fallback
-  js/world-scanner.js   depth-map fusion into a voxel point cloud, raw-camera
-                        color grab, live preview, chunked upload; demo-world
-                        generator fallback
+  js/world-scanner.js   AR session, timed raw-camera color grab, paged GPU
+                        geometry, watchdog-protected frame loop, chunked
+                        upload; demo-world generator fallback
+  js/world-fuse-worker.js  Web Worker doing the heavy lifting: depth-buffer
+                        unprojection, voxel dedupe, point storage, encoding
   js/world-explorer.js  point-cloud viewer: desktop fly, touch joystick,
                         AR diorama placement
   js/world-format.js    shared 10-byte-per-point binary world format

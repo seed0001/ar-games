@@ -1,49 +1,29 @@
 /**
  * WORLD SCANNER — walk around and paint reality into a point-cloud map.
  *
- * AR mode (Android Chrome with the Depth API): every ~6th frame the depth
- * image is unprojected through the device pose into world space and fused
- * into a voxel-deduped point cloud, which renders live over the camera view.
- * With WebXR raw camera access the points get real color; otherwise they get
- * a holographic elevation tint.
+ * AR mode (Android Chrome with the Depth API): every capture tick the raw
+ * CPU depth buffer (~40 KB) plus the view matrices are copied to a Web
+ * Worker (world-fuse-worker.js) which does all the heavy lifting —
+ * unprojection, voxel dedupe, storage — and posts back only the new points.
+ * The XR frame loop itself stays nearly idle, is wrapped so an error can
+ * never kill it, and a watchdog restarts it if it stalls anyway.
  *
- * No AR? A synthetic demo yard is generated so the save/upload/explore
- * pipeline still works everywhere.
+ * With WebXR raw camera access the points get real color (the readPixels
+ * grab is timed, and disabled for the session if this device is slow at
+ * it); otherwise a holographic elevation tint.
+ *
+ * No AR? A synthetic demo yard is generated through the same worker so the
+ * save/upload/explore pipeline still works everywhere.
  */
 import * as THREE from 'three';
-import { VOXEL, encodePoints } from './world-format.js';
 
 const CAP = 1_500_000;               // max points per world (~15 MB binary)
-const CAPTURE_MS = 170;              // initial depth fuse interval (self-throttles)
+const PAGE = 250_000;                // points per GPU geometry page
+const CAPTURE_MS = 170;              // min gap between capture ticks
 const CAM_GRAB_MS = 450;             // camera readPixels stalls the GPU — keep it rare
-const DEPTH_MIN = 0.25, DEPTH_MAX = 6.0;
 const CAM_W = 160, CAM_H = 120;      // downscaled camera color grab
 const CHUNK_BYTES = 4 * 1024 * 1024; // upload chunk size
-
-/* Open-addressing hash set of occupied voxels — flat typed array so a
-   full 1.5M-point scan stays memory-sane on a phone. */
-class VoxelSet {
-  constructor(points) {
-    let cap = 1;
-    while (cap < points * 2) cap *= 2;
-    this.keys = new Float64Array(cap);   // 0 = empty, else packed key + 1
-    this.mask = cap - 1;
-    this.size = 0;
-  }
-  /** returns true if the voxel was new */
-  add(qx, qy, qz) {
-    const key = (qx + 32768) * 4294967296 + (qy + 32768) * 65536 + (qz + 32768) + 1;
-    let h = ((qx * 73856093) ^ (qy * 19349663) ^ (qz * 83492791)) & this.mask;
-    const keys = this.keys;
-    while (keys[h] !== 0) {
-      if (keys[h] === key) return false;
-      h = (h + 1) & this.mask;
-    }
-    keys[h] = key;
-    this.size++;
-    return true;
-  }
-}
+const WARMUP_MS = 1200;              // let the session settle before first capture
 
 export class WorldScanner {
   constructor({ container, hud, xr, onExit, onSaved }) {
@@ -52,26 +32,26 @@ export class WorldScanner {
     this.xr = xr;                 // true = real AR scan, false = demo generator
     this.onExit = onExit;
     this.onSaved = onSaved;
-    this.state = 'boot';          // scanning | review | saving | done
+    this.state = 'boot';          // scanning | generating | review | saving | done
 
-    this.qpos = new Int16Array(CAP * 3);
-    this.cols = new Uint8Array(CAP * 3);
+    // mirrors of the worker's authoritative state
     this.count = 0;
-    this.voxels = new VoxelSet(CAP);
-    this.groundCells = new Set(); // ~1.3m ground cells, for the m² readout
-    this.min = [Infinity, Infinity, Infinity];
-    this.max = [-Infinity, -Infinity, -Infinity];
+    this._ground = 0;
+    this._min = [0, 0, 0];
+    this._max = [0, 0, 0];
 
-    this.tmpV = new THREE.Vector3();
+    this.pages = [];
     this.invProj = new THREE.Matrix4();
-    this.viewMat = new THREE.Matrix4();
     this.hasColor = false;
-    this.camPix = null;
-    this.captureInterval = CAPTURE_MS;
-    this._phase = 0;
-    this._depthStatus = 'waiting for depth…';
+    this.colorDisabled = false;
+    this._workerBusy = false;
+    this._pendingBatches = 0;
     this._lastCapture = 0;
     this._lastCamGrab = 0;
+    this._lastTick = performance.now();
+    this._recoveries = 0;
+    this._lastErr = null;
+    this._depthStatus = 'waiting for depth…';
     this._startedAt = 0;
     this._stopped = false;
   }
@@ -88,19 +68,12 @@ export class WorldScanner {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.02, 300);
     this.camera.position.set(0, 1.6, 0);
+    this.cloudMat = new THREE.PointsMaterial({ size: 0.03, vertexColors: true, sizeAttenuation: true });
 
-    // live point cloud with preallocated buffers
-    const geo = new THREE.BufferGeometry();
-    this.posAttr = new THREE.BufferAttribute(new Float32Array(CAP * 3), 3).setUsage(THREE.DynamicDrawUsage);
-    this.colAttr = new THREE.BufferAttribute(new Uint8Array(CAP * 3), 3, true).setUsage(THREE.DynamicDrawUsage);
-    geo.setAttribute('position', this.posAttr);
-    geo.setAttribute('color', this.colAttr);
-    geo.setDrawRange(0, 0);
-    this.cloud = new THREE.Points(geo, new THREE.PointsMaterial({
-      size: 0.03, vertexColors: true, sizeAttenuation: true,
-    }));
-    this.cloud.frustumCulled = false;
-    this.scene.add(this.cloud);
+    this.worker = new Worker('/js/world-fuse-worker.js');
+    this.worker.postMessage({ type: 'init', cap: CAP });
+    this.worker.onmessage = (e) => this.onWorkerMessage(e.data);
+    this.worker.onerror = (e) => { this._lastErr = 'worker: ' + (e.message || 'failed to load'); };
 
     this._onResize = () => {
       if (this.renderer.xr.isPresenting) return;
@@ -113,7 +86,22 @@ export class WorldScanner {
     if (this.xr) await this.startXR();
     else this.startDemo();
 
-    this.renderer.setAnimationLoop((time, frame) => this.tick(time, frame));
+    this._loop = (time, frame) => this.tick(time, frame);
+    this.renderer.setAnimationLoop(this._loop);
+
+    // a plain DOM timer keeps firing even if rAF dies — resurrect the loop
+    this._watchdog = setInterval(() => {
+      if (this._stopped) return;
+      if (performance.now() - this._lastTick > 2200) {
+        this._recoveries++;
+        this._lastErr = null;
+        try {
+          this.renderer.setAnimationLoop(null);
+          this.renderer.setAnimationLoop(this._loop);
+        } catch (e) { this._lastErr = 'restart: ' + e.message; }
+        this.setHint(`Recovered a stalled frame loop (×${this._recoveries}) — keep scanning.`);
+      }
+    }, 1200);
   }
 
   async startXR() {
@@ -150,29 +138,95 @@ export class WorldScanner {
 
     this.state = 'scanning';
     this._startedAt = performance.now();
+    this._lastCapture = this._startedAt + WARMUP_MS - CAPTURE_MS;
     this.buildScanHUD();
+  }
+
+  /* ---------------- worker plumbing ---------------- */
+  onWorkerMessage(m) {
+    if (this._stopped) return;
+    if (m.type === 'points') {
+      this._workerBusy = false;
+      this.count = m.total;
+      this._ground = m.ground;
+      this._min = m.min;
+      this._max = m.max;
+      if (m.n > 0) this.appendPoints(new Float32Array(m.pos), new Uint8Array(m.col), m.n);
+      if (this._pendingBatches > 0 && --this._pendingBatches === 0 && this.state === 'generating') {
+        this.state = 'review';
+        this.showSaveDialog();
+        const meta = this.hud.querySelector('.save-meta');
+        if (meta) meta.textContent = 'Demo terrain (no AR on this device) · ' + this.count.toLocaleString() + ' points';
+      }
+    } else if (m.type === 'encoded') {
+      const r = this._encodeResolve;
+      this._encodeResolve = null;
+      r?.(m);
+    } else if (m.type === 'error') {
+      this._workerBusy = false;
+      this._lastErr = 'worker: ' + m.message.slice(0, 50);
+    }
+  }
+
+  /** render the worker's new points into fixed-size GPU pages */
+  appendPoints(pos, col, n) {
+    let i = 0;
+    while (i < n) {
+      let page = this.pages[this.pages.length - 1];
+      if (!page || page.used >= PAGE) page = this.addPage();
+      const take = Math.min(n - i, PAGE - page.used);
+      page.pos.array.set(pos.subarray(i * 3, (i + take) * 3), page.used * 3);
+      page.col.array.set(col.subarray(i * 3, (i + take) * 3), page.used * 3);
+      for (const attr of [page.pos, page.col]) {
+        if (attr.addUpdateRange) attr.addUpdateRange(page.used * 3, take * 3);
+        attr.needsUpdate = true;
+      }
+      page.used += take;
+      page.geo.setDrawRange(0, page.used);
+      i += take;
+    }
+  }
+
+  addPage() {
+    const geo = new THREE.BufferGeometry();
+    const pos = new THREE.BufferAttribute(new Float32Array(PAGE * 3), 3).setUsage(THREE.DynamicDrawUsage);
+    const col = new THREE.BufferAttribute(new Uint8Array(PAGE * 3), 3, true).setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('position', pos);
+    geo.setAttribute('color', col);
+    geo.setDrawRange(0, 0);
+    const pts = new THREE.Points(geo, this.cloudMat);
+    pts.frustumCulled = false;
+    this.scene.add(pts);
+    const page = { geo, pos, col, pts, used: 0 };
+    this.pages.push(page);
+    return page;
   }
 
   /* ---------------- per-frame ---------------- */
   tick(time, frame) {
+    this._lastTick = performance.now();
     if (this._stopped) return;
+    try {
+      if (this.state === 'scanning' && frame &&
+          time - this._lastCapture >= CAPTURE_MS && !this._workerBusy && this.count < CAP) {
+        this._lastCapture = time;
+        this.captureFrame(frame);
+      }
 
-    if (this.state === 'scanning' && frame && time - this._lastCapture >= this.captureInterval && this.count < CAP) {
-      this._lastCapture = time;
-      try { this.captureFrame(frame); } catch (e) { /* single bad frame — keep scanning */ }
+      if (this.state === 'scanning' && time - (this._lastHud || 0) > 250) {
+        this._lastHud = time;
+        this.updateScanHUD();
+      }
+
+      // after the AR session ends we show the captured world on a slow orbit
+      if ((this.state === 'review' || this.state === 'saving') && !this.renderer.xr.isPresenting) {
+        this.orbitPreview(time);
+      }
+
+      this.renderer.render(this.scene, this.camera);
+    } catch (e) {
+      this._lastErr = String(e && e.message || e).slice(0, 60);
     }
-
-    if (this.state === 'scanning' && time - (this._lastHud || 0) > 250) {
-      this._lastHud = time;
-      this.updateScanHUD();
-    }
-
-    // after the AR session ends we show the captured world on a slow orbit
-    if ((this.state === 'review' || this.state === 'saving') && !this.renderer.xr.isPresenting) {
-      this.orbitPreview(time);
-    }
-
-    this.renderer.render(this.scene, this.camera);
   }
 
   captureFrame(frame) {
@@ -186,132 +240,49 @@ export class WorldScanner {
     try { depth = frame.getDepthInformation(view); }
     catch (e) { this._depthStatus = 'depth err: ' + e.message.slice(0, 40); return; }
     if (!depth) { this._depthStatus = 'no depth yet — keep moving'; return; }
+    if (!depth.data || !depth.normDepthBufferFromNormView) {
+      this._depthStatus = 'no raw depth buffer on this device';
+      return;
+    }
 
+    const n = depth.width * depth.height;
+    let isFloat;
+    if (depth.data.byteLength === n * 4) isFloat = true;
+    else if (depth.data.byteLength === n * 2) isFloat = false;
+    else { this._depthStatus = `odd depth layout ${depth.width}×${depth.height}/${depth.data.byteLength}b`; return; }
+    this._depthStatus = `depth ${depth.width}×${depth.height} ok`;
+
+    // occasional, timed camera color grab; give up on it if this device is slow
+    let cam = null;
     const t0 = performance.now();
-
-    if (this.glBinding && view.camera && t0 - this._lastCamGrab > CAM_GRAB_MS) {
+    if (!this.colorDisabled && this.glBinding && view.camera && t0 - this._lastCamGrab > CAM_GRAB_MS) {
       this._lastCamGrab = t0;
-      const pix = this.grabCameraPixels(view.camera);
-      if (pix) { this.camPix = pix; this.hasColor = true; }
+      try {
+        const pix = this.grabCameraPixels(view.camera);
+        if (performance.now() - t0 > 30) this.colorDisabled = true;
+        if (pix) {
+          cam = { buf: pix.slice().buffer, w: CAM_W, h: CAM_H };
+          this.hasColor = true;
+        }
+      } catch (e) {
+        this.colorDisabled = true;
+      }
     }
 
     this.invProj.fromArray(view.projectionMatrix).invert();
-    this.viewMat.fromArray(view.transform.matrix);
-    const before = this.count;
-
-    if (depth.data && depth.normDepthBufferFromNormView) this.fuseDepthBuffer(depth);
-    else if (depth.getDepthInMeters) this.fuseDepthSlow(depth);
-    else { this._depthStatus = 'unsupported depth format'; return; }
-
-    this.flushGeometry(before);
-
-    // self-throttle: a slow device spaces captures out instead of locking up
-    const ms = performance.now() - t0;
-    if (ms > 34) this.captureInterval = Math.min(700, this.captureInterval * 1.5);
-    else if (ms < 12 && this.captureInterval > CAPTURE_MS) {
-      this.captureInterval = Math.max(CAPTURE_MS, this.captureInterval * 0.8);
-    }
-  }
-
-  /** Fast path: index the raw CPU depth buffer directly — no per-pixel API calls. */
-  fuseDepthBuffer(depth) {
-    const w = depth.width, h = depth.height, n = w * h;
-    let raw, scale;
-    if (depth.data.byteLength === n * 4) { raw = new Float32Array(depth.data); scale = depth.rawValueToMeters || 1; }
-    else if (depth.data.byteLength === n * 2) { raw = new Uint16Array(depth.data); scale = depth.rawValueToMeters || 0.001; }
-    else { this._depthStatus = `odd depth layout ${w}×${h}/${depth.data.byteLength}b`; return; }
-    this._depthStatus = `depth ${w}×${h} ok`;
-
-    // maps depth-buffer UV → normalized view UV (handles the portrait rotation)
-    const inv = depth.normDepthBufferFromNormView.inverse.matrix;
-
-    const sx = Math.max(1, Math.round(w / 96));
-    const sy = Math.max(1, Math.round(h / 72)) * 2;   // every other row,
-    this._phase = 1 - this._phase;                     // alternating each tick
-    const y0 = this._phase * (sy >> 1);
-
-    for (let py = y0; py < h; py += sy) {
-      const dv = (py + 0.5) / h;
-      const row = py * w;
-      for (let px = 0; px < w; px += sx) {
-        const d = raw[row + px] * scale;
-        if (!(d >= DEPTH_MIN && d <= DEPTH_MAX)) continue;
-        const du = (px + 0.5) / w;
-        const u = inv[0] * du + inv[4] * dv + inv[12];
-        const v = inv[1] * du + inv[5] * dv + inv[13];
-        if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
-        this.fusePoint(u, v, d);
-        if (this.count >= CAP) return;
-      }
-    }
-  }
-
-  /** Fallback when raw buffer access is unavailable: sparse getDepthInMeters grid. */
-  fuseDepthSlow(depth) {
-    this._depthStatus = 'depth slow-path';
-    for (let iy = 0; iy < 30; iy++) {
-      const v = (iy + 0.5) / 30;
-      for (let ix = 0; ix < 40; ix++) {
-        const u = (ix + 0.5) / 40;
-        let d;
-        try { d = depth.getDepthInMeters(u, v); } catch (e) { continue; }
-        if (!(d >= DEPTH_MIN && d <= DEPTH_MAX)) continue;
-        this.fusePoint(u, v, d);
-        if (this.count >= CAP) return;
-      }
-    }
-  }
-
-  /** Unproject one (viewU, viewV, metres) sample into world space and fuse it. */
-  fusePoint(u, v, d) {
-    const v3 = this.tmpV;
-    v3.set(u * 2 - 1, 1 - v * 2, 0.5).applyMatrix4(this.invProj);
-    if (v3.z > -1e-6) return;
-    v3.multiplyScalar(d / -v3.z).applyMatrix4(this.viewMat);
-
-    let r, g, b;
-    const camPix = this.camPix;
-    if (camPix) {
-      const px = Math.min(CAM_W - 1, (u * CAM_W) | 0);
-      const py = Math.min(CAM_H - 1, ((1 - v) * CAM_H) | 0);
-      const o = (py * CAM_W + px) * 4;
-      r = camPix[o]; g = camPix[o + 1]; b = camPix[o + 2];
-    } else {
-      const t = Math.max(0, Math.min(1, (v3.y + 0.6) / 3.6));
-      r = 16 + t * 180; g = 60 + t * 180; b = 120 + t * 135;
-    }
-    this.addPoint(v3.x, v3.y, v3.z, r, g, b);
-  }
-
-  addPoint(x, y, z, r, g, b) {
-    const qx = Math.round(x / VOXEL), qy = Math.round(y / VOXEL), qz = Math.round(z / VOXEL);
-    if (qx < -32700 || qx > 32700 || qy < -32700 || qy > 32700 || qz < -32700 || qz > 32700) return;
-    if (!this.voxels.add(qx, qy, qz)) return;
-
-    const i = this.count * 3;
-    this.qpos[i] = qx; this.qpos[i + 1] = qy; this.qpos[i + 2] = qz;
-    this.cols[i] = r; this.cols[i + 1] = g; this.cols[i + 2] = b;
-    const pa = this.posAttr.array;
-    pa[i] = qx * VOXEL; pa[i + 1] = qy * VOXEL; pa[i + 2] = qz * VOXEL;
-    const ca = this.colAttr.array;
-    ca[i] = r; ca[i + 1] = g; ca[i + 2] = b;
-    this.count++;
-
-    if (x < this.min[0]) this.min[0] = x; if (x > this.max[0]) this.max[0] = x;
-    if (y < this.min[1]) this.min[1] = y; if (y > this.max[1]) this.max[1] = y;
-    if (z < this.min[2]) this.min[2] = z; if (z > this.max[2]) this.max[2] = z;
-    if (y < 1.0) this.groundCells.add(((qx >> 5) + 2048) * 4096 + ((qz >> 5) + 2048));
-  }
-
-  flushGeometry(before) {
-    if (this.count === before) return;
-    const off = before * 3, len = (this.count - before) * 3;
-    for (const attr of [this.posAttr, this.colAttr]) {
-      if (attr.addUpdateRange) attr.addUpdateRange(off, len);
-      else { attr.updateRange.offset = off; attr.updateRange.count = len; }
-      attr.needsUpdate = true;
-    }
-    this.cloud.geometry.setDrawRange(0, this.count);
+    const msg = {
+      type: 'fuse',
+      buf: depth.data.slice(0),
+      w: depth.width, h: depth.height,
+      isFloat,
+      scale: depth.rawValueToMeters || (isFloat ? 1 : 0.001),
+      invDepth: Array.from(depth.normDepthBufferFromNormView.inverse.matrix),
+      invProj: Array.from(this.invProj.elements),
+      viewMat: Array.from(view.transform.matrix),
+      cam,
+    };
+    this._workerBusy = true;
+    this.worker.postMessage(msg, cam ? [msg.buf, cam.buf] : [msg.buf]);
   }
 
   /* ---------------- raw camera color grab ---------------- */
@@ -416,12 +387,13 @@ export class WorldScanner {
     const q = (id) => this.hud.querySelector('#' + id);
     if (!q('scan-pts')) return;
     q('scan-pts').textContent = this.count.toLocaleString() + ' pts';
-    q('scan-area').textContent = Math.round(this.groundCells.size * 1.64) + ' m²';
+    q('scan-area').textContent = Math.round(this._ground * 1.64) + ' m²';
     const s = Math.floor((performance.now() - this._startedAt) / 1000);
     q('scan-time').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
     q('scan-cap-fill').style.width = Math.min(100, (this.count / CAP) * 100) + '%';
-    q('scan-debug').textContent =
-      `${this._depthStatus} · ${this.hasColor ? 'color ✓' : 'tint'} · ${Math.round(this.captureInterval)}ms`;
+    q('scan-debug').textContent = this._lastErr
+      ? 'ERR ' + this._lastErr
+      : `${this._depthStatus} · ${this.hasColor ? 'color ✓' : 'tint'}${this._recoveries ? ' · rec×' + this._recoveries : ''}`;
     if (this.count >= CAP) this.setHint('Memory full — finish and save your world.');
     else if (this.count === 0 && performance.now() - this._startedAt > 6000 && !this._zeroWarned) {
       this._zeroWarned = true;
@@ -445,10 +417,10 @@ export class WorldScanner {
   }
 
   orbitPreview(time) {
-    const cx = (this.min[0] + this.max[0]) / 2;
-    const cy = (this.min[1] + this.max[1]) / 2;
-    const cz = (this.min[2] + this.max[2]) / 2;
-    const spanX = this.max[0] - this.min[0], spanZ = this.max[2] - this.min[2];
+    const cx = (this._min[0] + this._max[0]) / 2;
+    const cy = (this._min[1] + this._max[1]) / 2;
+    const cz = (this._min[2] + this._max[2]) / 2;
+    const spanX = this._max[0] - this._min[0], spanZ = this._max[2] - this._min[2];
     const r = Math.max(4, Math.sqrt(spanX * spanX + spanZ * spanZ) * 0.75);
     const a = time * 0.00012;
     this.camera.position.set(cx + Math.cos(a) * r, cy + r * 0.5, cz + Math.sin(a) * r);
@@ -460,7 +432,7 @@ export class WorldScanner {
       <div class="save-dialog">
         <div class="save-card">
           <h3>🌍 World captured</h3>
-          <p class="save-meta">${this.count.toLocaleString()} points · ~${Math.round(this.groundCells.size * 1.64)} m² covered</p>
+          <p class="save-meta">${this.count.toLocaleString()} points · ~${Math.round(this._ground * 1.64)} m² covered</p>
           <input id="world-name" type="text" maxlength="40" placeholder="Name this world (e.g. Front Yard)" autocomplete="off">
           <div class="save-error hidden" id="save-error"></div>
           <div class="save-progress hidden" id="save-progress"><div class="save-progress-fill" id="save-progress-fill"></div></div>
@@ -499,19 +471,34 @@ export class WorldScanner {
     });
   }
 
+  requestEncode() {
+    return new Promise((resolve, reject) => {
+      this._encodeResolve = resolve;
+      this.worker.postMessage({ type: 'encode' });
+      setTimeout(() => {
+        if (this._encodeResolve === resolve) {
+          this._encodeResolve = null;
+          reject(new Error('Timed out packing the scan'));
+        }
+      }, 30000);
+    });
+  }
+
   async upload(name, onProgress) {
     const json = async (res) => {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Upload failed (' + res.status + ')');
       return data;
     };
+    const encoded = await this.requestEncode();
+    const bin = new Uint8Array(encoded.buf);
+
     const { id } = await json(await fetch('/api/worlds', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
     }));
 
-    const bin = encodePoints(this.qpos, this.cols, this.count);
     for (let off = 0; off < bin.byteLength; off += CHUNK_BYTES) {
       const part = bin.subarray(off, Math.min(off + CHUNK_BYTES, bin.byteLength));
       let lastErr = null;
@@ -533,13 +520,23 @@ export class WorldScanner {
     await json(await fetch(`/api/worlds/${id}/finish`, {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ points: this.count, bounds: { min: this.min, max: this.max } }),
+      body: JSON.stringify({ points: encoded.total, bounds: { min: encoded.min, max: encoded.max } }),
     }));
   }
 
   /* ---------------- demo world (no AR available) ---------------- */
   startDemo() {
     this.scene.background = new THREE.Color(0x05060a);
+    this.state = 'generating';
+    this.hasColor = true;
+
+    let batch = [];
+    const batches = [];
+    const push = (x, y, z, r, g, b) => {
+      batch.push(x, y, z, r, g, b);
+      if (batch.length >= 480000) { batches.push(new Float32Array(batch)); batch = []; }
+    };
+
     const rand = mulberry32(1337);
     const height = (x, z) =>
       Math.sin(x * 0.16 + 1.7) * Math.cos(z * 0.13 - 0.4) * 0.8 +
@@ -552,10 +549,8 @@ export class WorldScanner {
         const y = height(x, z);
         const pathDist = Math.abs(x - Math.sin(z * 0.25) * 3.2);
         const n = rand();
-        let r, g, b;
-        if (pathDist < 0.9) { r = 128 + n * 30; g = 100 + n * 26; b = 70 + n * 20; }
-        else { r = 40 + n * 30; g = 110 + n * 60; b = 38 + n * 26; }
-        this.addPoint(x, y, z, r, g, b);
+        if (pathDist < 0.9) push(x, y, z, 128 + n * 30, 100 + n * 26, 70 + n * 20);
+        else push(x, y, z, 40 + n * 30, 110 + n * 60, 38 + n * 26);
       }
     }
     // the house
@@ -571,8 +566,8 @@ export class WorldScanner {
       else { x = hx + hw / 2; z = hz - hd / 2 + along * hd; }
       const window_ = up > 1.1 && up < 2.2 && (along % 0.34) > 0.1 && (along % 0.34) < 0.22;
       const n = rand() * 18;
-      if (window_) this.addPoint(x, hy + up, z, 40 + n, 70 + n, 110 + n);
-      else this.addPoint(x, hy + up, z, 205 + n, 190 + n, 160 + n);
+      if (window_) push(x, hy + up, z, 40 + n, 70 + n, 110 + n);
+      else push(x, hy + up, z, 205 + n, 190 + n, 160 + n);
     }
     for (let t = 0; t < 60000; t++) { // pitched roof
       const along = rand(), across = rand();
@@ -580,7 +575,7 @@ export class WorldScanner {
       const z = hz - hd / 2 + across * hd;
       const y = hy + wallH + (1 - Math.abs(across - 0.5) * 2) * 1.6;
       const n = rand() * 16;
-      this.addPoint(x, y, z, 120 + n, 45 + n, 40 + n);
+      push(x, y, z, 120 + n, 45 + n, 40 + n);
     }
     // trees
     for (let i = 0; i < 11; i++) {
@@ -592,34 +587,34 @@ export class WorldScanner {
         const a = rand() * Math.PI * 2, up = rand() * trunkH;
         const rr = 0.1 + rand() * 0.08;
         const n = rand() * 20;
-        this.addPoint(tx + Math.cos(a) * rr, ty + up, tz + Math.sin(a) * rr, 92 + n, 62 + n, 38 + n);
+        push(tx + Math.cos(a) * rr, ty + up, tz + Math.sin(a) * rr, 92 + n, 62 + n, 38 + n);
       }
       for (let t = 0; t < 9000; t++) {
         const u = rand() * 2 - 1, a = rand() * Math.PI * 2;
         const rr = canR * Math.cbrt(rand());
         const sq = Math.sqrt(1 - u * u);
         const n = rand() * 42;
-        this.addPoint(tx + rr * sq * Math.cos(a), ty + trunkH + canR * 0.8 + rr * u * 0.85, tz + rr * sq * Math.sin(a), 26 + n, 96 + n, 30 + n);
+        push(tx + rr * sq * Math.cos(a), ty + trunkH + canR * 0.8 + rr * u * 0.85, tz + rr * sq * Math.sin(a), 26 + n, 96 + n, 30 + n);
       }
     }
-    this.flushGeometry(0);
-    this.hasColor = true;
-    this.state = 'review';
-    this.showSaveDialog();
-    const meta = this.hud.querySelector('.save-meta');
-    if (meta) meta.textContent = 'Demo terrain (no AR on this device) · ' + this.count.toLocaleString() + ' points';
+    if (batch.length) batches.push(new Float32Array(batch));
+
+    this._pendingBatches = batches.length;
+    for (const b of batches) this.worker.postMessage({ type: 'raw', buf: b.buffer }, [b.buffer]);
   }
 
   /* ---------------- teardown ---------------- */
   stop() {
     if (this._stopped) return;
     this._stopped = true;
+    clearInterval(this._watchdog);
+    this.worker?.terminate();
     this.renderer.setAnimationLoop(null);
     try { this.session?.end(); } catch (e) { /* already ended */ }
     window.removeEventListener('resize', this._onResize);
     this.hud.innerHTML = '';
-    this.cloud.geometry.dispose();
-    this.cloud.material.dispose();
+    for (const page of this.pages) page.geo.dispose();
+    this.cloudMat.dispose();
     this.renderer.dispose();
     this.container.innerHTML = '';
     this.onExit?.();
