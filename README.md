@@ -16,6 +16,17 @@ A WebXR cover shooter with **real positional tracking** (Android Chrome):
 
 No WebXR available (desktop, iPhone)? It falls back to a pointer-lock + WASD simulator with identical game logic.
 
+## 🌍 World Scanner + 🗺️ Explore Worlds
+
+Walk around your yard or house and **paint reality into a 3D map**:
+
+- Uses the WebXR **Depth API** (Android Chrome): every few frames the depth image is fused through the device pose into a voxel-deduped point cloud, live on screen as you walk
+- With WebXR raw camera access the points get **real color**; otherwise an elevation-tinted hologram look
+- Terrain height, trees, walls — anything you sweep the phone across within ~5 m gets captured (up to ~1.5M points per world)
+- Scans save to your account and appear in the shared **Worlds** gallery
+- Anyone can explore a world: WASD fly-through on desktop, joystick + drag-look on phones, or **diorama AR** — the whole world shrunk onto your real floor
+- No AR device? The scanner generates a synthetic demo yard so the full save/explore pipeline still works anywhere
+
 ## Run locally
 
 ```bash
@@ -36,15 +47,24 @@ WebXR AR requires HTTPS — test the real thing on a deployed URL or an HTTPS tu
 ## Architecture
 
 ```
-server.js              Express: static hosting + auth + leaderboard API (SQLite, bcrypt, JWT cookie)
+server.js               Express: static hosting + auth + leaderboard + worlds API
+                        (SQLite, bcrypt, JWT cookie; world point data as binary
+                        files under DATA_DIR/worlds)
 public/
-  index.html           auth / hub / AR stage shells
-  js/app.js            auth flow, hub, game launcher
-  js/xr-shooter.js     the game: WebXR session + hit-test floor placement,
-                       arena, enemy AI with line-of-sight checks, heat weapon,
-                       waves, procedural sound effects, desktop simulator fallback
+  index.html            auth / hub / AR stage shells
+  js/app.js             auth flow, hub, game + scanner + explorer launchers
+  js/xr-shooter.js      Cover Fire: WebXR session + hit-test floor placement,
+                        arena, enemy AI with line-of-sight checks, heat weapon,
+                        waves, procedural sound effects, desktop simulator fallback
+  js/world-scanner.js   depth-map fusion into a voxel point cloud, raw-camera
+                        color grab, live preview, chunked upload; demo-world
+                        generator fallback
+  js/world-explorer.js  point-cloud viewer: desktop fly, touch joystick,
+                        AR diorama placement
+  js/world-format.js    shared 10-byte-per-point binary world format
 ```
 
 ## Privacy
 
-The AR camera view is composited by the OS/browser — the app only receives your device pose, never camera pixels. Nothing is recorded or uploaded.
+- **Cover Fire** only receives your device pose — never camera pixels. Nothing is recorded or uploaded.
+- **World Scanner** additionally reads depth maps and (where supported) camera pixels **on your phone** to color the scan. Raw camera frames never leave the device — only the resulting 3D points are uploaded, and only when you explicitly save a world. Saved worlds are visible to all signed-in players until you delete them.

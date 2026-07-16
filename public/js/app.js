@@ -1,4 +1,6 @@
 import { ShooterGame, arSupported } from './xr-shooter.js';
+import { WorldScanner } from './world-scanner.js';
+import { WorldExplorer } from './world-explorer.js';
 
 // ---------- tiny helpers ----------
 const $ = (id) => document.getElementById(id);
@@ -37,9 +39,14 @@ const MODES = [
     launch: launchShooter,
   },
   {
-    id: 'soon1', icon: '🧪', name: 'In the lab…', glow: 'rgba(124,92,255,0.15)',
-    desc: 'More full-tracking AR experiences are being outlined. This slot is reserved.',
-    disabled: true,
+    id: 'scanner', icon: '🌍', name: 'World Scanner', glow: 'rgba(0,255,170,0.22)',
+    desc: 'Walk your yard, your street, your house — the phone paints everything you sweep it across into a 3D map, trees and terrain and all. Save it to your account and share it.',
+    launch: launchScanner,
+  },
+  {
+    id: 'worlds', icon: '🗺️', name: 'Explore Worlds', glow: 'rgba(124,92,255,0.25)',
+    desc: 'Wander through worlds other players scanned — fly through them on any device, or shrink one onto your own floor in AR like a hologram diorama.',
+    launch: () => showWorldsGallery(),
   },
 ];
 
@@ -196,6 +203,117 @@ async function launchShooter(modeDef) {
       freshBtn.disabled = false;
     }
   }, { once: true });
+}
+
+// ---------- world scanner launch ----------
+async function launchScanner(modeDef) {
+  const xr = await arSupported();
+  show('stage');
+  $('hud').innerHTML = '';
+
+  $('intro-icon').textContent = modeDef.icon;
+  $('intro-title').textContent = modeDef.name;
+  $('intro-desc').textContent = xr
+    ? 'Walk slowly and sweep your phone across everything — ground, trees, walls. The 3D map paints in live as you move. Get close to things (the depth camera reaches about 5 metres).'
+    : 'No AR on this device — generating a demo world instead so you can try the save + explore pipeline. Real scanning runs in Chrome on Android.';
+  $('intro-perms').textContent = xr
+    ? 'uses AR camera, depth + motion tracking · points are processed on your phone'
+    : 'demo generator (no camera needed)';
+  $('intro').classList.remove('hidden');
+
+  const startBtn = $('intro-start');
+  const freshBtn = startBtn.cloneNode(true);
+  freshBtn.textContent = xr ? 'Start scanning' : 'Generate demo world';
+  startBtn.replaceWith(freshBtn);
+
+  freshBtn.addEventListener('click', async () => {
+    freshBtn.disabled = true;
+    try {
+      game = new WorldScanner({
+        container: $('gl-container'),
+        hud: $('hud'),
+        xr,
+        onExit: () => { game = null; show('hub'); },
+        onSaved: ({ name }) => toast(`🌍 “${name}” saved — find it in Explore Worlds`),
+      });
+      await game.start();
+      window.__game = game;
+      $('intro').classList.add('hidden');
+    } catch (err) {
+      console.error(err);
+      toast('Could not start the scanner: ' + err.message, 5000);
+      game = null;
+      show('hub');
+    } finally {
+      freshBtn.disabled = false;
+    }
+  }, { once: true });
+}
+
+// ---------- worlds gallery + explorer ----------
+async function showWorldsGallery() {
+  $('modal-title').textContent = '🗺️ Worlds';
+  $('modal-body').innerHTML = '<div class="lb-empty">Loading…</div>';
+  $('modal').classList.remove('hidden');
+  try {
+    const { worlds } = await api('/api/worlds');
+    if (!worlds.length) {
+      $('modal-body').innerHTML = '<div class="lb-empty">No worlds yet — be the first to scan one!</div>';
+      return;
+    }
+    $('modal-body').innerHTML = worlds.map((w) => `
+      <div class="world-row" data-id="${w.id}">
+        <div class="world-info">
+          <span class="world-name">${escapeHtml(w.name)}</span>
+          <span class="world-meta">by ${escapeHtml(w.username)} · ${(w.points / 1000).toFixed(0)}k pts · ${w.created.slice(0, 10)}</span>
+        </div>
+        ${w.mine ? `<button class="world-del" data-del="${w.id}" title="Delete">🗑</button>` : ''}
+      </div>
+    `).join('');
+
+    for (const row of $('modal-body').querySelectorAll('.world-row')) {
+      row.addEventListener('click', () => {
+        const w = worlds.find((x) => x.id === Number(row.dataset.id));
+        $('modal').classList.add('hidden');
+        launchExplorer(w);
+      });
+    }
+    for (const btn of $('modal-body').querySelectorAll('.world-del')) {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm('Delete this world for everyone?')) return;
+        try {
+          await api(`/api/worlds/${btn.dataset.del}`, { method: 'DELETE' });
+          showWorldsGallery();
+        } catch (err) { toast(err.message); }
+      });
+    }
+  } catch (err) {
+    $('modal-body').innerHTML = `<div class="lb-empty">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function launchExplorer(world) {
+  const xr = await arSupported();
+  show('stage');
+  $('intro').classList.add('hidden');
+  $('hud').innerHTML = '';
+  try {
+    game = new WorldExplorer({
+      container: $('gl-container'),
+      hud: $('hud'),
+      world,
+      xr,
+      onExit: () => { game = null; show('hub'); },
+    });
+    await game.start();
+    window.__game = game;
+  } catch (err) {
+    console.error(err);
+    toast('Could not open world: ' + err.message, 5000);
+    game = null;
+    show('hub');
+  }
 }
 
 // scores + leaderboard events from the game

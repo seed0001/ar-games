@@ -29,7 +29,27 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_scores_mode ON scores(mode, score DESC);
+  CREATE TABLE IF NOT EXISTS worlds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'uploading',
+    points INTEGER NOT NULL DEFAULT 0,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    bounds TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
+
+const WORLDS_DIR = path.join(DATA_DIR, 'worlds');
+fs.mkdirSync(WORLDS_DIR, { recursive: true });
+const worldFile = (id) => path.join(WORLDS_DIR, `${id}.bin`);
+
+// scrap uploads that never finished (e.g. the app was killed mid-scan)
+for (const row of db.prepare(`SELECT id FROM worlds WHERE status = 'uploading'`).all()) {
+  try { fs.unlinkSync(worldFile(row.id)); } catch (e) { /* no file yet */ }
+  db.prepare('DELETE FROM worlds WHERE id = ?').run(row.id);
+}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -125,6 +145,98 @@ app.get('/api/leaderboard', auth(false), (req, res) => {
     LIMIT 10
   `).all(mode);
   res.json({ top: rows });
+});
+
+/* ---------------- worlds (scanned 3D environments) ---------------- */
+const RECORD_BYTES = 10;                    // one point = x,y,z int16 + rgb packed
+const MAX_WORLD_BYTES = 24 * 1024 * 1024;   // ~2.4M points
+const MAX_WORLDS_PER_USER = 20;
+
+app.post('/api/worlds', auth(), (req, res) => {
+  let { name } = req.body || {};
+  name = String(name || '').replace(/[\u0000-\u001f]/g, '').trim();
+  if (name.length < 1 || name.length > 40) {
+    return res.status(400).json({ error: 'World name must be 1-40 characters' });
+  }
+  const count = db.prepare(`SELECT COUNT(*) AS n FROM worlds WHERE user_id = ? AND status = 'ready'`).get(req.user.id).n;
+  if (count >= MAX_WORLDS_PER_USER) {
+    return res.status(400).json({ error: `Limit of ${MAX_WORLDS_PER_USER} worlds — delete one first` });
+  }
+  // a user only ever has one in-flight upload; abandon any previous one
+  for (const row of db.prepare(`SELECT id FROM worlds WHERE user_id = ? AND status = 'uploading'`).all(req.user.id)) {
+    try { fs.unlinkSync(worldFile(row.id)); } catch (e) { /* no file yet */ }
+    db.prepare('DELETE FROM worlds WHERE id = ?').run(row.id);
+  }
+  const info = db.prepare('INSERT INTO worlds (user_id, name) VALUES (?, ?)').run(req.user.id, name);
+  res.json({ id: info.lastInsertRowid });
+});
+
+function ownedUploadingWorld(req, res) {
+  const w = db.prepare('SELECT * FROM worlds WHERE id = ?').get(Number(req.params.id));
+  if (!w || w.user_id !== req.user.id) { res.status(404).json({ error: 'World not found' }); return null; }
+  if (w.status !== 'uploading') { res.status(400).json({ error: 'World already finalized' }); return null; }
+  return w;
+}
+
+app.put('/api/worlds/:id/data', auth(), express.raw({ type: '*/*', limit: '6mb' }), (req, res) => {
+  const w = ownedUploadingWorld(req, res);
+  if (!w) return;
+  const chunk = req.body;
+  if (!Buffer.isBuffer(chunk) || chunk.length === 0) return res.status(400).json({ error: 'Empty chunk' });
+  if (w.size_bytes + chunk.length > MAX_WORLD_BYTES) return res.status(413).json({ error: 'World too large' });
+  fs.appendFileSync(worldFile(w.id), chunk);
+  db.prepare('UPDATE worlds SET size_bytes = size_bytes + ? WHERE id = ?').run(chunk.length, w.id);
+  res.json({ ok: true, size: w.size_bytes + chunk.length });
+});
+
+app.post('/api/worlds/:id/finish', auth(), (req, res) => {
+  const w = ownedUploadingWorld(req, res);
+  if (!w) return;
+  const { points, bounds } = req.body || {};
+  const n = Math.floor(Number(points));
+  let size = 0;
+  try { size = fs.statSync(worldFile(w.id)).size; } catch (e) { /* missing */ }
+  if (!Number.isFinite(n) || n < 100 || n * RECORD_BYTES !== size) {
+    try { fs.unlinkSync(worldFile(w.id)); } catch (e) { /* already gone */ }
+    db.prepare('DELETE FROM worlds WHERE id = ?').run(w.id);
+    return res.status(400).json({ error: 'Upload incomplete or corrupt — scan discarded' });
+  }
+  db.prepare(`UPDATE worlds SET status = 'ready', points = ?, size_bytes = ?, bounds = ? WHERE id = ?`)
+    .run(n, size, JSON.stringify(bounds || null).slice(0, 500), w.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/worlds', auth(false), (req, res) => {
+  const rows = db.prepare(`
+    SELECT w.id, w.name, w.points, w.size_bytes, w.bounds, w.created_at, u.username, w.user_id
+    FROM worlds w JOIN users u ON u.id = w.user_id
+    WHERE w.status = 'ready'
+    ORDER BY w.id DESC LIMIT 100
+  `).all();
+  res.json({
+    worlds: rows.map((r) => ({
+      id: r.id, name: r.name, points: r.points, size: r.size_bytes,
+      bounds: r.bounds ? JSON.parse(r.bounds) : null,
+      created: r.created_at, username: r.username,
+      mine: !!(req.user && req.user.id === r.user_id),
+    })),
+  });
+});
+
+app.get('/api/worlds/:id/data', (req, res) => {
+  const w = db.prepare(`SELECT * FROM worlds WHERE id = ? AND status = 'ready'`).get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'World not found' });
+  res.set('Content-Type', 'application/octet-stream');
+  res.set('Cache-Control', 'private, max-age=3600');
+  res.sendFile(worldFile(w.id));
+});
+
+app.delete('/api/worlds/:id', auth(), (req, res) => {
+  const w = db.prepare('SELECT * FROM worlds WHERE id = ?').get(Number(req.params.id));
+  if (!w || w.user_id !== req.user.id) return res.status(404).json({ error: 'World not found' });
+  try { fs.unlinkSync(worldFile(w.id)); } catch (e) { /* file already gone */ }
+  db.prepare('DELETE FROM worlds WHERE id = ?').run(w.id);
+  res.json({ ok: true });
 });
 
 app.use('/vendor/three', express.static(path.join(__dirname, 'node_modules/three/build'), { maxAge: '7d' }));
