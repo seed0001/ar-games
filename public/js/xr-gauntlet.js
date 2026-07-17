@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { SFX, glowTexture } from './xr-shooter.js';
+import { MusicEngine } from './music.js';
 
 /* 🏃 GAUNTLET RUN — WebXR walking cover-shooter obstacle course.
  *
@@ -55,6 +56,7 @@ export class GauntletGame {
     this.xr = xr;
     this.onExit = onExit;
     this.sfx = new SFX();
+    this.music = new MusicEngine();
     this.state = 'boot';        // placing | run | dead | won
     this.playerPos = new THREE.Vector3(0, 1.6, 0);
     this.enemies = [];
@@ -186,6 +188,7 @@ export class GauntletGame {
   stop() {
     if (this._stopped) return;
     this._stopped = true;
+    this.music.stop(true);
     this.renderer.setAnimationLoop(null);
     try { this.session?.end(); } catch (e) { /* already ended */ }
     this.hud.removeEventListener('beforexrselect', this._beforeSelect || (() => {}));
@@ -396,6 +399,7 @@ export class GauntletGame {
         <div class="hud-hint" id="gr-hint"></div>
         <div class="dmg-vignette" id="gr-dmg"></div>
         <button class="exit-btn hud-exit" id="gr-exit">✕</button>
+        <button class="exit-btn hud-mute" id="gr-mute">${this.music.muted ? '🔇' : '🔊'}</button>
       </div>
     `;
     this.el = {
@@ -411,6 +415,11 @@ export class GauntletGame {
       xhair: this.hud.querySelector('.xhair'),
     };
     this.hud.querySelector('#gr-exit').addEventListener('click', () => this.stop());
+    const muteBtn = this.hud.querySelector('#gr-mute');
+    muteBtn.addEventListener('click', () => {
+      this.music.setMuted(!this.music.muted);
+      muteBtn.textContent = this.music.muted ? '🔇' : '🔊';
+    });
   }
 
   setHint(text) {
@@ -461,6 +470,9 @@ export class GauntletGame {
     this.el.score.textContent = '0';
     this.updateHpBar();
     this.setState('run');
+    this.sfx.ensure();
+    this.music.start(this.sfx.ctx);
+    this.music.setLevel(0);
     this.setHint(this.xr
       ? 'Shoot the drones from cover, then WALK through the gate when it opens'
       : '');
@@ -473,6 +485,7 @@ export class GauntletGame {
 
   /* ---------------- enemies ---------------- */
   spawnZone(zone) {
+    this.music.setLevel(zone);                    // track heats up per zone
     const count = 2 + zone;                       // 2,3,4,5,6
     const sentries = zone >= 2 ? Math.min(2, zone - 1) : 0;
     for (let i = 0; i < count; i++) {
@@ -670,6 +683,7 @@ export class GauntletGame {
   /* ---------------- endings ---------------- */
   die() {
     this.setState('dead');
+    this.music.stop();
     for (let i = this.enemies.length - 1; i >= 0; i--) {
       this.explode(this.enemies[i].group.position, COL.enemy);
       this.removeEnemy(this.enemies[i], i);
@@ -685,6 +699,7 @@ export class GauntletGame {
 
   win() {
     this.setState('won');
+    this.music.stop();
     const t = this.elapsed - this.runStart;
     const timeBonus = Math.max(0, Math.round((420 - t) * 8));
     this.addScore(1000 + timeBonus);

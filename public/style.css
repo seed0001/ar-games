@@ -493,6 +493,12 @@ body { overflow: hidden; }
   top: max(14px, env(safe-area-inset-top));
   left: 14px;
 }
+.hud-mute {
+  position: absolute;
+  top: calc(max(14px, env(safe-area-inset-top)) + 52px);
+  left: 14px;
+  font-size: 15px;
+}
 .xr-hud .game-over { pointer-events: auto; }
 
 /* ---------- MODAL / TOAST ---------- */
