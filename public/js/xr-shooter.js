@@ -20,7 +20,7 @@ const COL = {
 };
 
 /* ---------------- procedural sound effects ---------------- */
-class SFX {
+export class SFX {
   ensure() {
     if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     if (this.ctx.state === 'suspended') this.ctx.resume();
@@ -60,7 +60,7 @@ class SFX {
 }
 
 /* ---------------- helpers ---------------- */
-function gridTexture() {
+export function gridTexture() {
   const c = document.createElement('canvas');
   c.width = c.height = 512;
   const x = c.getContext('2d');
@@ -76,7 +76,7 @@ function gridTexture() {
   return new THREE.CanvasTexture(c);
 }
 
-function glowTexture() {
+export function glowTexture() {
   const c = document.createElement('canvas');
   c.width = c.height = 64;
   const x = c.getContext('2d');

@@ -395,6 +395,39 @@ body { overflow: hidden; }
   text-shadow: 0 0 14px rgba(0, 229, 255, 0.9);
 }
 
+/* gauntlet course progress */
+.run-wrap {
+  position: absolute;
+  top: calc(max(14px, env(safe-area-inset-top)) + 40px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+}
+.run-track {
+  width: 170px;
+  height: 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 211, 77, 0.5);
+  background: rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.run-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #00e5ff, #ffd34d);
+  transition: width 0.2s;
+}
+.run-meta {
+  font-size: 13px;
+  font-weight: 800;
+  color: #fff;
+  text-shadow: 0 0 10px rgba(255, 211, 77, 0.8);
+  white-space: nowrap;
+}
+
 .heat-wrap {
   position: absolute;
   bottom: max(24px, env(safe-area-inset-bottom));

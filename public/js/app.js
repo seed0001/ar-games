@@ -1,5 +1,6 @@
 import { tlog, flush } from './telemetry.js';
 import { ShooterGame, arSupported } from './xr-shooter.js';
+import { GauntletGame } from './xr-gauntlet.js';
 import { WorldScanner } from './world-scanner.js';
 import { WorldExplorer } from './world-explorer.js';
 
@@ -38,6 +39,12 @@ const MODES = [
     desc: 'A hard-light arena deploys onto your real floor. Enemies track your ACTUAL body — physically walk behind cover to block their shots, pop out and fire back. Real movement, real cover. Leaderboard.',
     leaderboard: true,
     launch: launchShooter,
+  },
+  {
+    id: 'gauntlet', icon: '🏃', name: 'Gauntlet Run', glow: 'rgba(255,170,60,0.22)',
+    desc: 'A 100-foot hard-light obstacle course deploys down your driveway. Physically run it — duck behind barricades, clear each zone of drones to unlock the gate, and race the clock to the finish line. Leaderboard.',
+    leaderboard: true,
+    launch: launchGauntlet,
   },
   {
     id: 'scanner', icon: '🌍', name: 'World Scanner', glow: 'rgba(0,255,170,0.22)',
@@ -195,6 +202,50 @@ async function launchShooter(modeDef) {
     freshBtn.disabled = true;
     try {
       game = new ShooterGame({
+        container: $('gl-container'),
+        hud: $('hud'),
+        xr,
+        onExit: () => { game = null; show('hub'); },
+      });
+      await game.start();
+      window.__game = game; // debug handle
+      $('intro').classList.add('hidden');
+    } catch (err) {
+      console.error(err);
+      toast('Could not start AR: ' + err.message, 4500);
+      game = null;
+      show('hub');
+    } finally {
+      freshBtn.disabled = false;
+    }
+  }, { once: true });
+}
+
+// ---------- gauntlet launch ----------
+async function launchGauntlet(modeDef) {
+  const xr = await arSupported();
+  show('stage');
+  $('hud').innerHTML = '';
+
+  $('intro-icon').textContent = modeDef.icon;
+  $('intro-title').textContent = modeDef.name;
+  $('intro-desc').textContent = xr
+    ? 'You need a LONG clear path — a driveway is perfect. Stand at the start, aim down it, and tap to lay a 100-foot course. Then physically walk it: use the barricades as cover, clear each zone of drones to unlock the gate, and race to the finish.'
+    : 'No AR on this device — launching the desktop simulator so you can try the course. The real experience runs in Chrome on Android.';
+  $('intro-perms').textContent = xr
+    ? 'uses AR camera + motion tracking · needs ~100 ft of clear space · watch where you walk!'
+    : 'desktop simulator (WASD + mouse)';
+  $('intro').classList.remove('hidden');
+
+  const startBtn = $('intro-start');
+  const freshBtn = startBtn.cloneNode(true);
+  freshBtn.textContent = xr ? 'Enter AR' : 'Launch simulator';
+  startBtn.replaceWith(freshBtn);
+
+  freshBtn.addEventListener('click', async () => {
+    freshBtn.disabled = true;
+    try {
+      game = new GauntletGame({
         container: $('gl-container'),
         hud: $('hud'),
         xr,

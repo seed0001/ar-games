@@ -126,7 +126,7 @@ app.get('/api/me', auth(false), (req, res) => {
   res.json({ user: req.user ? { id: req.user.id, username: req.user.username } : null });
 });
 
-const VALID_MODES = new Set(['shooter']);
+const VALID_MODES = new Set(['shooter', 'gauntlet']);
 
 app.post('/api/scores', auth(), (req, res) => {
   const { mode, score } = req.body || {};
