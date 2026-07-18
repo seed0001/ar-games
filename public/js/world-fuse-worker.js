@@ -37,177 +37,6 @@ const groundCells = new Set();
 const min = [Infinity, Infinity, Infinity];
 const max = [-Infinity, -Infinity, -Infinity];
 
-/* ---------------- volumetric surface (TSDF -> mesh) ----------------
- * A second, parallel representation of the scan used purely for the live
- * mesh. Space is diced into 8³-voxel blocks (32 cm) stored sparsely; each
- * voxel accumulates a weighted truncated signed distance plus averaged
- * color. Revisiting a spot raises its weight, tightening the surface and
- * refining color — that is what makes the framework "fill in".
- */
-const B = 8;                      // voxels per block edge
-const B3 = B * B * B;
-const TRUNC = 3 * VOXEL;          // 0.12 m signed-distance truncation band
-const TSTEP = VOXEL;              // ray-march step when carving the band
-const KT = 3;                     // samples each side of the surface (±TRUNC)
-const WMIN = 2;                   // a voxel is "known solid" only after this many hits
-const WMAX = 24;                  // weight saturation (revisits keep influence, bounded)
-const MESH_BUDGET = 6;            // dirty blocks re-meshed per fuse tick (phone budget)
-
-const CORNER = [[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]];
-const EDGE = [[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[4,5],[4,6],[3,7],[5,7],[6,7]];
-
-let blocks = new Map();           // blockKey -> block record
-let dirty = new Set();            // block keys awaiting a re-mesh
-const _cellVert = new Int32Array(B3);   // scratch: cell -> emitted vertex id
-
-const blockKey = (bx, by, bz) => ((bx + 1024) * 2048 + (by + 1024)) * 2048 + (bz + 1024);
-
-function getBlock(bx, by, bz) {
-  const k = blockKey(bx, by, bz);
-  let bl = blocks.get(k);
-  if (!bl) {
-    bl = {
-      key: k, bx, by, bz,
-      tsdf: new Float32Array(B3), w: new Float32Array(B3),
-      cr: new Float32Array(B3), cg: new Float32Array(B3),
-      cb: new Float32Array(B3), cw: new Float32Array(B3),
-    };
-    blocks.set(k, bl);
-  }
-  return bl;
-}
-
-/** fold one signed-distance observation into the voxel grid */
-function voxelUpdate(vx, vy, vz, sdf, wr, r, g, b, colorSample) {
-  const bx = vx >> 3, by = vy >> 3, bz = vz >> 3;
-  const bl = getBlock(bx, by, bz);
-  const i = (((vx - (bx << 3)) * B) + (vy - (by << 3))) * B + (vz - (bz << 3));
-  const w0 = bl.w[i];
-  bl.tsdf[i] = (bl.tsdf[i] * w0 + sdf * wr) / (w0 + wr);
-  bl.w[i] = Math.min(WMAX, w0 + wr);
-  if (colorSample) { bl.cr[i] += r; bl.cg[i] += g; bl.cb[i] += b; bl.cw[i] += 1; }
-  dirty.add(bl.key);
-}
-
-/** signed-distance corner sample; unseen / under-confirmed cells read as "outside" */
-const cornerVal = (bl, lx, ly, lz) => {
-  const i = (lx * B + ly) * B + lz;
-  return bl.w[i] < WMIN ? 1.0 : bl.tsdf[i];
-};
-
-/**
- * Naive surface nets over a single block: one vertex per surface cell placed
- * at the average of its edge zero-crossings, quads across sign-changing edges.
- * Blocks mesh independently (a ~4 cm seam between blocks is tolerated for now),
- * so any dirty block re-meshes without touching its neighbors.
- */
-function meshBlock(bl) {
-  _cellVert.fill(-1);
-  const vX = [], vY = [], vZ = [], vR = [], vG = [], vB = [], vC = [];
-  const quads = [];
-  const ox = bl.bx * B, oy = bl.by * B, oz = bl.bz * B;
-
-  for (let x = 0; x < B - 1; x++)
-    for (let y = 0; y < B - 1; y++)
-      for (let z = 0; z < B - 1; z++) {
-        const g = [
-          cornerVal(bl, x, y, z),     cornerVal(bl, x + 1, y, z),
-          cornerVal(bl, x, y + 1, z), cornerVal(bl, x + 1, y + 1, z),
-          cornerVal(bl, x, y, z + 1), cornerVal(bl, x + 1, y, z + 1),
-          cornerVal(bl, x, y + 1, z + 1), cornerVal(bl, x + 1, y + 1, z + 1),
-        ];
-        let neg = 0;
-        for (let c = 0; c < 8; c++) if (g[c] < 0) neg++;
-
-        if (neg !== 0 && neg !== 8) {
-          let ax = 0, ay = 0, az = 0, cnt = 0;
-          for (let e = 0; e < 12; e++) {
-            const a = EDGE[e][0], bb = EDGE[e][1], ga = g[a], gb = g[bb];
-            if ((ga < 0) !== (gb < 0)) {
-              const t = ga / (ga - gb), oa = CORNER[a], ob = CORNER[bb];
-              ax += oa[0] + t * (ob[0] - oa[0]);
-              ay += oa[1] + t * (ob[1] - oa[1]);
-              az += oa[2] + t * (ob[2] - oa[2]);
-              cnt++;
-            }
-          }
-          ax /= cnt; ay /= cnt; az /= cnt;
-
-          let cr = 0, cg = 0, cb = 0, cc = 0, maxw = 0;
-          for (let c = 0; c < 8; c++) {
-            const i = ((x + CORNER[c][0]) * B + (y + CORNER[c][1])) * B + (z + CORNER[c][2]);
-            if (bl.w[i] >= WMIN) {
-              if (bl.cw[i] > 0) { cr += bl.cr[i] / bl.cw[i]; cg += bl.cg[i] / bl.cw[i]; cb += bl.cb[i] / bl.cw[i]; cc++; }
-              if (bl.w[i] > maxw) maxw = bl.w[i];
-            }
-          }
-          const id = vX.length;
-          _cellVert[(x * B + y) * B + z] = id;
-          vX.push((ox + x + ax) * VOXEL); vY.push((oy + y + ay) * VOXEL); vZ.push((oz + z + az) * VOXEL);
-          if (cc > 0) { vR.push(cr / cc); vG.push(cg / cc); vB.push(cb / cc); }
-          else { vR.push(200); vG.push(200); vB.push(200); }
-          vC.push(maxw / WMAX);
-        }
-
-        // faces: emit a quad for each sign-changing minimal edge whose four
-        // surrounding cells (all "earlier" in the scan order) have vertices
-        const s0 = g[0] < 0;
-        for (let i = 0; i < 3; i++) {
-          const gi = i === 0 ? g[1] : i === 1 ? g[2] : g[4];
-          if (s0 === (gi < 0)) continue;
-          const iu = (i + 1) % 3, iv = (i + 2) % 3;
-          const coord = [x, y, z];
-          if (coord[iu] < 1 || coord[iv] < 1) continue;
-          const du = [iu === 0 ? 1 : 0, iu === 1 ? 1 : 0, iu === 2 ? 1 : 0];
-          const dv = [iv === 0 ? 1 : 0, iv === 1 ? 1 : 0, iv === 2 ? 1 : 0];
-          const ci = (px, py, pz) => _cellVert[(px * B + py) * B + pz];
-          const a = ci(x, y, z);
-          const b = ci(x - du[0], y - du[1], z - du[2]);
-          const c = ci(x - du[0] - dv[0], y - du[1] - dv[1], z - du[2] - dv[2]);
-          const d = ci(x - dv[0], y - dv[1], z - dv[2]);
-          if (a < 0 || b < 0 || c < 0 || d < 0) continue;
-          quads.push(a, b, c, d);
-        }
-      }
-
-  const nQ = quads.length / 4;
-  if (nQ === 0) return { msg: { type: 'mesh', key: bl.key, bx: bl.bx, by: bl.by, bz: bl.bz, empty: true } };
-
-  const nOut = nQ * 6;
-  const pos = new Float32Array(nOut * 3);
-  const col = new Uint8Array(nOut * 3);
-  const conf = new Uint8Array(nOut);
-  let o = 0;
-  const emit = (id) => {
-    pos[o * 3] = vX[id]; pos[o * 3 + 1] = vY[id]; pos[o * 3 + 2] = vZ[id];
-    col[o * 3] = vR[id]; col[o * 3 + 1] = vG[id]; col[o * 3 + 2] = vB[id];
-    conf[o] = Math.max(0, Math.min(255, vC[id] * 255));
-    o++;
-  };
-  for (let q = 0; q < nQ; q++) {
-    const a = quads[q * 4], b = quads[q * 4 + 1], c = quads[q * 4 + 2], d = quads[q * 4 + 3];
-    emit(a); emit(b); emit(c); emit(a); emit(c); emit(d);
-  }
-  return {
-    msg: { type: 'mesh', key: bl.key, bx: bl.bx, by: bl.by, bz: bl.bz, pos: pos.buffer, col: col.buffer, conf: conf.buffer },
-    transfer: [pos.buffer, col.buffer, conf.buffer],
-  };
-}
-
-/** re-mesh up to `budget` dirty blocks and post each result */
-function meshDirty(budget) {
-  let n = 0;
-  for (const key of dirty) {
-    if (n >= budget) break;
-    dirty.delete(key); n++;
-    const bl = blocks.get(key);
-    if (!bl) continue;
-    const r = meshBlock(bl);
-    if (r.transfer) postMessage(r.msg, r.transfer);
-    else postMessage(r.msg);
-  }
-}
-
 function init(cap) {
   CAP = cap;
   count = 0;
@@ -221,8 +50,6 @@ function init(cap) {
   pkeys = new Float64Array(PENDING_SLOTS);
   pinfo = new Uint32Array(PENDING_SLOTS);
   pcol = new Uint32Array(PENDING_SLOTS);
-  blocks = new Map();
-  dirty = new Set();
 }
 
 const voxelKey = (qx, qy, qz) => (qx + 32768) * 4294967296 + (qy + 32768) * 65536 + (qz + 32768) + 1;
@@ -337,7 +164,6 @@ function fuse(m) {
   const scale = m.scale;
   if (m.cam) lastCam = { data: new Uint8Array(m.cam.buf), w: m.cam.w, h: m.cam.h };
   const invD = m.invDepth, invP = m.invProj, view = m.viewMat;
-  const cx = view[12], cy = view[13], cz = view[14];   // camera world position
   tick++;
 
   const sx = Math.max(1, Math.round(w / 96));
@@ -400,28 +226,9 @@ function fuse(m) {
         added++;
       }
 
-      // volumetric fusion for the live mesh: carve the signed-distance band
-      // along this pixel's camera ray (free space in front, solid behind)
-      let rx = wx - cx, ry = wy - cy, rz = wz - cz;
-      const dist = Math.sqrt(rx * rx + ry * ry + rz * rz);
-      if (dist > 1e-3) {
-        const inv = 1 / dist; rx *= inv; ry *= inv; rz *= inv;
-        for (let k = -KT; k <= KT; k++) {
-          const t = k * TSTEP;
-          const vx = Math.round((wx + rx * t) / VOXEL);
-          const vy = Math.round((wy + ry * t) / VOXEL);
-          const vz = Math.round((wz + rz * t) / VOXEL);
-          if (vx < -32700 || vx > 32700 || vy < -32700 || vy > 32700 || vz < -32700 || vz > 32700) continue;
-          let sdf = -t / TRUNC;
-          if (sdf > 1) sdf = 1; else if (sdf < -1) sdf = -1;
-          voxelUpdate(vx, vy, vz, sdf, 1, r, g, b, k === 0);
-        }
-      }
-
       if (count >= CAP) break outer;
     }
   }
-  meshDirty(MESH_BUDGET);
   reply(outPos, outCol, added);
 }
 
@@ -442,13 +249,7 @@ function raw(m) {
       outCol[j] = r; outCol[j + 1] = g; outCol[j + 2] = b;
       added++;
     }
-    // seed the surface volume too: no camera ray here, so mark this voxel
-    // solid and let its unseen neighbours read as "outside" (a thin shell)
-    const vx = Math.round(x / VOXEL), vy = Math.round(y / VOXEL), vz = Math.round(z / VOXEL);
-    if (vx >= -32700 && vx <= 32700 && vy >= -32700 && vy <= 32700 && vz >= -32700 && vz <= 32700)
-      voxelUpdate(vx, vy, vz, -0.6, WMAX, r, g, b, true);
   }
-  meshDirty(1e9);   // demo is generated once — flush every dirty block now
   reply(outPos, outCol, added);
 }
 

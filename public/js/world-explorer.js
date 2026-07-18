@@ -13,7 +13,7 @@ import { clampPointSize } from './world-scanner.js';
 const EYE = 1.7;
 const DIORAMA_SIZE = 1.4; // metres, longest side when placed on your floor
 const MAX_SOLID_FACES = 1_500_000; // beyond this fall back to the point cloud
-const VIEW_LABEL = { smooth: '◼ smooth', blocky: '▦ blocky', dots: '· dots' };
+const VIEW_LABEL = { blocky: '▦ blocky', dots: '· dots' };
 
 /**
  * Turn the voxel-gridded point cloud into a connected surface: every stored
@@ -111,11 +111,6 @@ export class WorldExplorer {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x05060a);
     this.scene.fog = new THREE.Fog(0x05060a, 20, 130);
-    // lights for the reconstructed (shaded) surface; points/blocky are unlit
-    this.scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x2a2a24, 1.15));
-    const sun = new THREE.DirectionalLight(0xfff2e0, 1.5);
-    sun.position.set(0.5, 1, 0.35);
-    this.scene.add(sun);
     this.camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.02, 400);
     this.camera.rotation.order = 'YXZ';
 
@@ -136,15 +131,10 @@ export class WorldExplorer {
     this.solid = buildVoxelMesh(positions, colors, count);
     if (this.solid) this.worldGroup.add(this.solid);
 
-    // clean, smooth surface — outlier removal + density-field reconstruction
-    this.setLoadLabel('Cleaning up surface…');
-    this.smooth = await this.reconstruct(positions, colors, count).catch(() => null);
-    if (this.smooth) this.worldGroup.add(this.smooth);
-
     this.scene.add(this.worldGroup);
 
-    // default to the best view we managed to build
-    this.view = this.smooth ? 'smooth' : this.solid ? 'blocky' : 'dots';
+    // points are the primary view; the blocky voxel surface stays as a toggle
+    this.view = 'dots';
     this.applyView();
 
     geo.computeBoundingBox();
@@ -211,55 +201,14 @@ export class WorldExplorer {
     if (el) el.style.width = Math.round(f * 100) + '%';
   }
 
-  setLoadLabel(msg) {
-    const el = this.hud.querySelector('#load-label');
-    if (el) el.textContent = msg;
-  }
-
-  /* ---------------- surface reconstruction ---------------- */
-  /** run the cleanup worker; resolve to a shaded smooth Mesh, or null */
-  reconstruct(positions, colors, count) {
-    return new Promise((resolve) => {
-      let worker;
-      try { worker = new Worker('/js/world-reconstruct.js'); }
-      catch (e) { resolve(null); return; }
-      this._reconWorker = worker;
-      const done = (mesh) => { try { worker.terminate(); } catch (e) {} this._reconWorker = null; resolve(mesh); };
-      const timer = setTimeout(() => done(null), 45000);
-      worker.onerror = () => { clearTimeout(timer); done(null); };
-      worker.onmessage = (e) => {
-        const m = e.data;
-        if (m.type !== 'done') { if (m.type === 'error') { clearTimeout(timer); done(null); } return; }
-        clearTimeout(timer);
-        if (!m.idx.length) { done(null); return; }
-        const g = new THREE.BufferGeometry();
-        g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(m.pos), 3));
-        g.setAttribute('color', new THREE.BufferAttribute(new Uint8Array(m.col), 3, true));
-        g.setIndex(new THREE.BufferAttribute(new Uint32Array(m.idx), 1));
-        g.computeVertexNormals();
-        const mesh = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
-        mesh.frustumCulled = false;
-        this._reconStats = m.stats;
-        done(mesh);
-      };
-      // copy the buffers so the caller's arrays (used by the point cloud) survive
-      const pos = positions.slice(), col = colors.slice();
-      worker.postMessage(
-        { type: 'reconstruct', positions: pos.buffer, colors: col.buffer, count, opts: {} },
-        [pos.buffer, col.buffer]);
-    });
-  }
-
-  /** show exactly one of the three representations */
+  /** show exactly one of the representations */
   applyView() {
-    if (this.smooth) this.smooth.visible = this.view === 'smooth';
     if (this.solid) this.solid.visible = this.view === 'blocky';
     this.cloud.visible = this.view === 'dots';
   }
 
   cycleView() {
-    const order = ['smooth', 'blocky', 'dots'].filter(
-      (v) => v === 'dots' || (v === 'smooth' && this.smooth) || (v === 'blocky' && this.solid));
+    const order = ['dots', 'blocky'].filter((v) => v === 'dots' || this.solid);
     this.view = order[(order.indexOf(this.view) + 1) % order.length];
     this.applyView();
     const label = this.hud.querySelector('#exp-mode');
@@ -268,8 +217,7 @@ export class WorldExplorer {
 
   buildHUD() {
     const arBtn = this.xr ? '<button class="btn-ghost" id="exp-ar">◈ diorama AR</button>' : '';
-    const hasAlt = this.smooth || this.solid;
-    const modeBtn = hasAlt ? `<button class="btn-ghost" id="exp-mode">${VIEW_LABEL[this.view]}</button>` : '';
+    const modeBtn = this.solid ? `<button class="btn-ghost" id="exp-mode">${VIEW_LABEL[this.view]}</button>` : '';
     this.hud.innerHTML = `
       <div class="exp-top">
         <span class="exp-title">🗺️ ${esc(this.world.name)} <em>by ${esc(this.world.username)}</em></span>
@@ -517,11 +465,9 @@ export class WorldExplorer {
     window.removeEventListener('mousemove', this._onMouseMove || (() => {}));
     if (document.pointerLockElement) document.exitPointerLock();
     this.hud.innerHTML = '';
-    try { this._reconWorker?.terminate(); } catch (e) { /* already gone */ }
     this.cloud?.geometry.dispose();
     this.material?.dispose();
     if (this.solid) { this.solid.geometry.dispose(); this.solid.material.dispose(); }
-    if (this.smooth) { this.smooth.geometry.dispose(); this.smooth.material.dispose(); }
     this.renderer.dispose();
     this.container.innerHTML = '';
     this.onExit?.();
