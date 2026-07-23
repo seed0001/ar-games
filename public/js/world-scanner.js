@@ -195,11 +195,12 @@ export class WorldScanner {
       this._ground = m.ground;
       this._min = m.min;
       this._max = m.max;
-      if (m.n > 0) {
-        const t0 = performance.now();
-        this.appendPoints(new Float32Array(m.pos), new Uint8Array(m.col), m.n);
-        const ms = performance.now() - t0;
-        if (ms > this._stats.appendMs) this._stats.appendMs = ms;
+      if (m.n > 0 || m.updN > 0) {
+        const a0 = performance.now();
+        if (m.n > 0) this.appendPoints(new Float32Array(m.pos), new Uint8Array(m.col), m.n);
+        if (m.updN > 0) this.patchPoints(new Int32Array(m.updIdx), new Float32Array(m.updPos), new Uint8Array(m.updCol), m.updN);
+        const aMs = performance.now() - a0;
+        if (aMs > this._stats.appendMs) this._stats.appendMs = aMs;
       }
       if (this._pendingBatches > 0 && --this._pendingBatches === 0 && this.state === 'generating') {
         this.state = 'review';
@@ -236,6 +237,30 @@ export class WorldScanner {
       page.geo.setDrawRange(0, page.used);
       i += take;
     }
+  }
+
+  /**
+   * Move/recolor points the worker already sent, in place. Points are appended
+   * to fixed PAGE-sized pages in commit order, so global index i lives at page
+   * ⌊i/PAGE⌋, slot i%PAGE — a direct lookup, no map needed. This is what makes
+   * re-scanning a surface visibly sharpen the blocks already on screen.
+   */
+  patchPoints(idx, pos, col, n) {
+    const touched = new Set();
+    for (let k = 0; k < n; k++) {
+      const gi = idx[k];
+      const pi = (gi / PAGE) | 0;
+      const page = this.pages[pi];
+      if (!page) continue;
+      const slot = gi - pi * PAGE;
+      if (slot >= page.used) continue;
+      const po = slot * 3, so = k * 3;
+      page.pos.array[po] = pos[so]; page.pos.array[po + 1] = pos[so + 1]; page.pos.array[po + 2] = pos[so + 2];
+      page.col.array[po] = col[so]; page.col.array[po + 1] = col[so + 1]; page.col.array[po + 2] = col[so + 2];
+      if (page.pos.addUpdateRange) { page.pos.addUpdateRange(po, 3); page.col.addUpdateRange(po, 3); }
+      touched.add(page);
+    }
+    for (const page of touched) { page.pos.needsUpdate = true; page.col.needsUpdate = true; }
   }
 
   addPage() {
