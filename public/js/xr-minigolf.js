@@ -9,8 +9,10 @@ import { HOLES, BALL_RADIUS } from './minigolf-holes.js';
  * course isn't re-placed per hole. Drag-to-putt: pull back, release to shoot,
  * same direction/power convention as a slingshot.
  *
- * Sim mode: fixed orbit camera over the green. Left-drag putts, right-drag
- * orbits, wheel zooms.
+ * Sim mode (no AR support — most phones/tablets land here): the course
+ * sits on a rendered elevated table stand you orbit around freely, like
+ * walking around a table. A finger/click on the ball putts; a finger/click
+ * anywhere else orbits; pinch or scroll zooms.
  */
 
 const COL = { green: 0x1c6b3a, wall: 0x0e1420, edge: 0x34e1ff, water: 0x1670c9, sand: 0xd8b979, cup: 0x05070c };
@@ -102,6 +104,7 @@ export class MiniGolfGame {
     this.scene.add(this.courseGroup);
 
     this.buildBall();
+    this.buildTableStand();
     this.buildHUD();
     this.bindPuttInput();
 
@@ -163,18 +166,17 @@ export class MiniGolfGame {
   }
 
   startSim() {
-    this.simOrbit = { theta: 0.5, phi: 1.05, radius: 1.3 };
-    this.simKeys = {};
+    this.simOrbit = { theta: 0.6, phi: 0.85, radius: 1.8 };
     this._onWheel = (e) => {
       e.preventDefault();
-      this.simOrbit.radius = Math.max(0.5, Math.min(2.4, this.simOrbit.radius + e.deltaY * 0.001));
+      this.simOrbit.radius = Math.max(0.6, Math.min(2.8, this.simOrbit.radius + e.deltaY * 0.0015));
     };
     this.renderer.domElement.addEventListener('wheel', this._onWheel, { passive: false });
     this._onCtxMenu = (e) => e.preventDefault();
     this.renderer.domElement.addEventListener('contextmenu', this._onCtxMenu);
 
-    this.placeCourse(new THREE.Vector3(0, -0.55, -0.9));
-    this.setHint('Left-drag = putt · right-drag = orbit · scroll = zoom');
+    this.placeCourse(new THREE.Vector3(0, 0, 0));
+    this.setHint('Drag the ball to putt · drag anywhere else to walk around · pinch/scroll to zoom');
   }
 
   /* ---------------- placement ---------------- */
@@ -200,6 +202,46 @@ export class MiniGolfGame {
     const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35, metalness: 0.05, emissive: 0x113344, emissiveIntensity: 0.4 });
     this.ballMesh = new THREE.Mesh(geo, mat);
     this.courseGroup.add(this.ballMesh);
+  }
+
+  /* ---------------- table stand ----------------
+   * A rendered, walk-around-able elevated stand the course sits on — built
+   * once, sized to comfortably fit every hole. Only shown in sim mode: in
+   * AR the course sits on whatever real tabletop the player pointed at, so
+   * a virtual stand underneath would just float through it.
+   */
+  buildTableStand() {
+    const TABLE_W = 1.55, TABLE_D = 0.85, THICK = 0.03, LEG_H = 0.75, INSET = 0.07;
+    const g = new THREE.Group();
+    const bodyMat = new THREE.MeshStandardMaterial({ color: COL.wall, roughness: 0.5, metalness: 0.35 });
+    const edgeMat = new THREE.LineBasicMaterial({ color: COL.edge, transparent: true, opacity: 0.75 });
+
+    const slabGeo = new THREE.BoxGeometry(TABLE_W, THICK, TABLE_D);
+    const slab = new THREE.Mesh(slabGeo, bodyMat);
+    slab.position.y = -THICK / 2 - 0.001;
+    slab.add(new THREE.LineSegments(new THREE.EdgesGeometry(slabGeo), edgeMat));
+    g.add(slab);
+
+    const legGeo = new THREE.BoxGeometry(0.05, LEG_H, 0.05);
+    const legX = TABLE_W / 2 - INSET, legZ = TABLE_D / 2 - INSET, legY = -THICK - LEG_H / 2;
+    for (const [x, z] of [[legX, legZ], [-legX, legZ], [legX, -legZ], [-legX, -legZ]]) {
+      const leg = new THREE.Mesh(legGeo, bodyMat);
+      leg.position.set(x, legY, z);
+      leg.add(new THREE.LineSegments(new THREE.EdgesGeometry(legGeo), edgeMat));
+      g.add(leg);
+    }
+
+    const floorSpan = Math.min(TABLE_W, TABLE_D) * 0.95;
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(floorSpan * 0.45, floorSpan * 0.52, 32).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: COL.edge, transparent: true, opacity: 0.18, side: THREE.DoubleSide })
+    );
+    ring.position.y = -THICK - LEG_H + 0.001;
+    g.add(ring);
+
+    g.visible = !this.xr;
+    this.tableStand = g;
+    this.courseGroup.add(g);
   }
 
   /* ---------------- hole load / geometry ---------------- */
@@ -335,11 +377,20 @@ export class MiniGolfGame {
     return g;
   }
 
-  /* ---------------- input ---------------- */
+  /* ---------------- input ----------------
+   * One finger on the ball putts; one finger anywhere else walks the camera
+   * around the table; two fingers pinch-zoom (mouse: wheel zooms, drag
+   * putts/orbits the same way). Works identically for touch and mouse since
+   * it's driven entirely by ball-screen-proximity, not click buttons.
+   */
   bindPuttInput() {
-    let dragBtn = null;
-    let start = null;
     const el = this.hud;
+    const pointers = new Map(); // pointerId -> {x,y}
+    let mode = null; // 'putt' | 'orbit' | 'pinch'
+    let puttPointerId = null;
+    let puttStart = null;
+    let orbitLast = null;
+    let pinchStart = null; // {dist, radius}
 
     const flatAxes = () => {
       const cam = this.renderer.xr.isPresenting ? this.renderer.xr.getCamera() : this.camera;
@@ -350,49 +401,96 @@ export class MiniGolfGame {
       return { right, fwd };
     };
 
+    const ballScreenPos = () => {
+      const v = new THREE.Vector3();
+      this.ballMesh.getWorldPosition(v);
+      const cam = this.renderer.xr.isPresenting ? this.renderer.xr.getCamera() : this.camera;
+      v.project(cam);
+      return { x: (v.x * 0.5 + 0.5) * window.innerWidth, y: (-v.y * 0.5 + 0.5) * window.innerHeight };
+    };
+
+    const pinchDist = () => {
+      const pts = [...pointers.values()];
+      return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    };
+
+    const finishPutt = (x, y) => {
+      const dx = x - puttStart.x, dy = y - puttStart.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 8) {
+        const { right, fwd } = flatAxes();
+        const pull = new THREE.Vector3().addScaledVector(right, dx).addScaledVector(fwd, -dy);
+        if (pull.lengthSq() > 1e-6) {
+          pull.normalize().multiplyScalar(-1); // shoot opposite of pull
+          const local = pull.clone().applyQuaternion(this.courseGroup.quaternion.clone().invert());
+          this.putt(local.x, local.z, Math.min(1, len / 220));
+        }
+      }
+      this.showPowerMeter(false);
+    };
+
     this._onDown = (e) => {
       if (e.target.closest && e.target.closest('button')) return;
-      const isRight = e.button === 2;
-      if (isRight && !this.xr) { dragBtn = 'orbit'; start = { x: e.clientX, y: e.clientY }; return; }
-      if (!this.awaitingInput || !this.placed) return;
-      dragBtn = 'putt';
-      start = { x: e.clientX, y: e.clientY };
-      this.setPowerMeter(0);
-      this.showPowerMeter(true);
-    };
-    this._onMove = (e) => {
-      if (!dragBtn || !start) return;
-      const dx = e.clientX - start.x, dy = e.clientY - start.y;
-      if (dragBtn === 'orbit') {
-        this.simOrbit.theta -= dx * 0.006;
-        this.simOrbit.phi = Math.max(0.35, Math.min(1.5, this.simOrbit.phi - dy * 0.006));
-        start = { x: e.clientX, y: e.clientY };
-      } else {
-        const len = Math.hypot(dx, dy);
-        this.setPowerMeter(Math.min(1, len / 220));
-      }
-    };
-    this._onUp = (e) => {
-      if (dragBtn === 'putt' && start) {
-        const dx = e.clientX - start.x, dy = e.clientY - start.y;
-        const len = Math.hypot(dx, dy);
-        if (len > 8) {
-          const { right, fwd } = flatAxes();
-          const pull = new THREE.Vector3().addScaledVector(right, dx).addScaledVector(fwd, -dy);
-          if (pull.lengthSq() > 1e-6) {
-            pull.normalize().multiplyScalar(-1); // shoot opposite of pull
-            const local = pull.clone().applyQuaternion(this.courseGroup.quaternion.clone().invert());
-            const power = Math.min(1, len / 220);
-            this.putt(local.x, local.z, power);
-          }
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pointers.size === 1) {
+        const canPutt = this.awaitingInput && this.placed;
+        const nearBall = canPutt && (this.xr || Math.hypot(e.clientX - ballScreenPos().x, e.clientY - ballScreenPos().y) < 70);
+        if (nearBall) {
+          mode = 'putt';
+          puttPointerId = e.pointerId;
+          puttStart = { x: e.clientX, y: e.clientY };
+          this.setPowerMeter(0);
+          this.showPowerMeter(true);
+        } else if (!this.xr) {
+          mode = 'orbit';
+          orbitLast = { x: e.clientX, y: e.clientY };
+        } else {
+          mode = null;
         }
-        this.showPowerMeter(false);
+      } else if (pointers.size === 2 && !this.xr) {
+        if (mode === 'putt') this.showPowerMeter(false);
+        mode = 'pinch';
+        pinchStart = { dist: pinchDist(), radius: this.simOrbit.radius };
       }
-      dragBtn = null; start = null;
     };
+
+    this._onMove = (e) => {
+      if (!pointers.has(e.pointerId)) return;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (mode === 'pinch' && pointers.size >= 2) {
+        const d = pinchDist();
+        if (d > 1) this.simOrbit.radius = Math.max(0.6, Math.min(2.8, pinchStart.radius * (pinchStart.dist / d)));
+      } else if (mode === 'orbit' && e.pointerId !== puttPointerId) {
+        const dx = e.clientX - orbitLast.x, dy = e.clientY - orbitLast.y;
+        this.simOrbit.theta -= dx * 0.006;
+        this.simOrbit.phi = Math.max(0.28, Math.min(1.45, this.simOrbit.phi - dy * 0.006));
+        orbitLast = { x: e.clientX, y: e.clientY };
+      } else if (mode === 'putt' && e.pointerId === puttPointerId) {
+        this.setPowerMeter(Math.min(1, Math.hypot(e.clientX - puttStart.x, e.clientY - puttStart.y) / 220));
+      }
+    };
+
+    this._onUp = (e) => {
+      pointers.delete(e.pointerId);
+
+      if (mode === 'putt' && e.pointerId === puttPointerId) {
+        finishPutt(e.clientX, e.clientY);
+        mode = null; puttPointerId = null; puttStart = null;
+      } else if (mode === 'pinch' && pointers.size < 2) {
+        const remaining = [...pointers.values()][0];
+        mode = remaining ? 'orbit' : null;
+        orbitLast = remaining || null;
+      } else if (pointers.size === 0) {
+        mode = null;
+      }
+    };
+
     el.addEventListener('pointerdown', this._onDown);
     window.addEventListener('pointermove', this._onMove);
     window.addEventListener('pointerup', this._onUp);
+    window.addEventListener('pointercancel', this._onUp);
   }
 
   putt(dirX, dirZ, power) {
@@ -694,7 +792,10 @@ export class MiniGolfGame {
     window.removeEventListener('resize', this._onResize);
     if (this._onDown) this.hud.removeEventListener('pointerdown', this._onDown);
     if (this._onMove) window.removeEventListener('pointermove', this._onMove);
-    if (this._onUp) window.removeEventListener('pointerup', this._onUp);
+    if (this._onUp) {
+      window.removeEventListener('pointerup', this._onUp);
+      window.removeEventListener('pointercancel', this._onUp);
+    }
     if (this._onWheel) this.renderer.domElement.removeEventListener('wheel', this._onWheel);
     if (this._onCtxMenu) this.renderer.domElement.removeEventListener('contextmenu', this._onCtxMenu);
     this.hud.innerHTML = '';
