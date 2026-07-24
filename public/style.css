@@ -823,6 +823,23 @@ body { overflow: hidden; }
 .mg-table th, .mg-table td { padding: 4px 8px; text-align: center; color: var(--dim); }
 .mg-table th { color: var(--text); border-bottom: 1px solid var(--card-border); }
 
+.mg-placement {
+  position: absolute;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+}
+.mg-placement button { border-radius: 999px; padding: 12px 22px; width: auto; white-space: nowrap; }
+.mg-placement .btn-primary:disabled { opacity: 0.4; cursor: default; }
+
+.hud-reset {
+  top: calc(max(14px, env(safe-area-inset-top)) + 52px);
+  left: 14px;
+  font-size: 17px;
+}
+
 /* ---------- UNO LOBBY ---------- */
 .lobby-or { text-align: center; color: var(--dim); font-size: 13px; margin: 16px 0; }
 .lobby-join-row { display: flex; gap: 8px; }

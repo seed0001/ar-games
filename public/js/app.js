@@ -51,7 +51,7 @@ const MODES = [
   },
   {
     id: 'minigolf', icon: '⛳', name: 'Mini-Golf', glow: 'rgba(88,255,150,0.22)',
-    desc: 'An 18-hole course deploys onto your real tabletop, one hole at a time. Drag back and release to putt — ramps, water, sand, and windmills included. Leaderboard.',
+    desc: 'A waist-high table deploys onto your real floor — walk all the way around it and putt through 18 holes, one at a time. Ramps, water, sand, and windmills included. Leaderboard.',
     leaderboard: true,
     launch: launchMiniGolf,
   },
@@ -289,7 +289,7 @@ async function launchMiniGolf(modeDef) {
   $('intro-icon').textContent = modeDef.icon;
   $('intro-title').textContent = modeDef.name;
   $('intro-desc').textContent = xr
-    ? 'Find a real tabletop. Aim at it and tap to place the course, then drag back on the ball and release to putt — same feel as a slingshot. The course stays put as you play all 18 holes.'
+    ? 'Point at your floor — a translucent table preview follows your aim. Tap (or press Place) to drop it, then drag to rotate and pinch to resize before you confirm. Once locked in, walk all the way around it and drag back on the ball to putt.'
     : 'No AR on this device — launching the desktop version so you can try the course. The real experience runs in Chrome on Android.';
   $('intro-perms').textContent = xr ? 'uses AR camera + motion tracking' : 'desktop mode (mouse drag + scroll)';
   $('intro').classList.remove('hidden');

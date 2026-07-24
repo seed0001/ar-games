@@ -71,6 +71,8 @@ export class MiniGolfGame {
     this.gridTex = gridTexture();
     this._stopped = false;
     this.placed = false;
+    this.arPhase = 'searching'; // AR only: 'searching' | 'preview' | 'confirmed'
+    this._freshPlacement = true; // whether the next Place should start a new round
     this.holeIndex = 0;
     this.scorecard = []; // strokes per hole
     this.effects = [];
@@ -152,17 +154,13 @@ export class MiniGolfGame {
       if (e.target.closest && e.target.closest('button')) e.preventDefault();
     };
     this.hud.addEventListener('beforexrselect', this._beforeSelect);
-    this._onSelect = () => {
-      if (!this.placed && this.reticle.visible) {
-        this.tmpV = new THREE.Vector3().setFromMatrixPosition(this.reticle.matrix);
-        this.placeCourse(this.tmpV);
-      }
-    };
+    this._onSelect = () => this.arPlaceHere();
     session.addEventListener('select', this._onSelect);
     session.addEventListener('end', () => { if (!this._stopped) this.stop(); });
 
     this.sfx.ensure();
-    this.setHint('Point your phone at a tabletop — tap to place the course');
+    this.updatePlacementHUD();
+    this.setHint('Point your phone at the floor — tap or press Place');
   }
 
   startSim() {
@@ -179,7 +177,7 @@ export class MiniGolfGame {
     this.setHint('Drag the ball to putt · drag anywhere else to walk around · pinch/scroll to zoom');
   }
 
-  /* ---------------- placement ---------------- */
+  /* ---------------- placement (sim: instant; AR: see arPlaceHere/arConfirm/arReposition/arReset) ---------------- */
   placeCourse(pos) {
     this.courseGroup.position.copy(pos);
     this.courseGroup.rotation.y = 0;
@@ -196,6 +194,89 @@ export class MiniGolfGame {
     this.loadHole(0);
   }
 
+  /* ---------------- AR placement flow ----------------
+   * searching (reticle follows the detected floor) -> preview (translucent
+   * table dropped at the tapped spot, rotate/scale adjustable) -> confirmed
+   * (locked anchor, full gameplay, walk around freely — real device tracking).
+   */
+  arPlaceHere() {
+    if (this.arPhase !== 'searching' || !this.reticle?.visible) return;
+    const pos = new THREE.Vector3().setFromMatrixPosition(this.reticle.matrix);
+    this.courseGroup.position.copy(pos);
+    this.courseGroup.visible = true;
+    this.reticle.visible = false;
+    this.arPhase = 'preview';
+    if (this._freshPlacement) {
+      this.courseGroup.rotation.y = 0;
+      this.courseGroup.scale.setScalar(1);
+      this.beginRound();
+      this._freshPlacement = false;
+    }
+    this.setPreviewTranslucent(true);
+    this.updatePlacementHUD();
+    this.setHint('Drag to rotate · pinch to resize · tap Confirm when ready');
+  }
+
+  arConfirm() {
+    if (this.arPhase !== 'preview') return;
+    this.setPreviewTranslucent(false);
+    this.arPhase = 'confirmed';
+    this.placed = true;
+    this.updatePlacementHUD();
+    this.setHint('Walk around the table — drag the ball to putt');
+    this.sfx.holeAdvance();
+  }
+
+  arReposition() {
+    if (this.arPhase === 'searching') return;
+    this.placed = false;
+    this.setPreviewTranslucent(false);
+    this.courseGroup.visible = false;
+    this.arPhase = 'searching';
+    this.updatePlacementHUD();
+    this.setHint('Point your phone at the floor — tap or press Place');
+  }
+
+  arReset() {
+    this.placed = false;
+    this.setPreviewTranslucent(false);
+    this.courseGroup.visible = false;
+    this.courseGroup.rotation.y = 0;
+    this.courseGroup.scale.setScalar(1);
+    this._freshPlacement = true;
+    this.arPhase = 'searching';
+    this.updatePlacementHUD();
+    this.setHint('Point your phone at the floor — tap or press Place');
+  }
+
+  /** dim every material in the placed course so it reads as a not-yet-confirmed ghost */
+  setPreviewTranslucent(on) {
+    this.courseGroup.traverse((obj) => {
+      const mat = obj.material;
+      if (!mat) return;
+      if (on) {
+        if (mat._origOpacity === undefined) {
+          mat._origOpacity = mat.opacity;
+          mat._origTransparent = mat.transparent;
+        }
+        mat.transparent = true;
+        mat.opacity = Math.min(mat._origOpacity, 0.5);
+      } else if (mat._origOpacity !== undefined) {
+        mat.opacity = mat._origOpacity;
+        mat.transparent = mat._origTransparent;
+      }
+    });
+  }
+
+  updatePlacementHUD() {
+    if (!this.xr || !this.el?.place) return;
+    const phase = this.arPhase;
+    this.el.place.classList.toggle('hidden', phase !== 'searching');
+    this.el.confirm.classList.toggle('hidden', phase !== 'preview');
+    this.el.reposition.classList.toggle('hidden', phase === 'searching');
+    this.el.reset.classList.toggle('hidden', phase === 'searching');
+  }
+
   /* ---------------- ball ---------------- */
   buildBall() {
     const geo = new THREE.SphereGeometry(BALL_RADIUS, 16, 16);
@@ -206,9 +287,9 @@ export class MiniGolfGame {
 
   /* ---------------- table stand ----------------
    * A rendered, walk-around-able elevated stand the course sits on — built
-   * once, sized to comfortably fit every hole. Only shown in sim mode: in
-   * AR the course sits on whatever real tabletop the player pointed at, so
-   * a virtual stand underneath would just float through it.
+   * once, sized to comfortably fit every hole. Shown in both modes: in AR
+   * the player aims at real floor, and this stand is what supplies the
+   * waist-height playing surface (rather than requiring a real table).
    */
   buildTableStand() {
     const TABLE_W = 1.55, TABLE_D = 0.85, THICK = 0.03, LEG_H = 0.75, INSET = 0.07;
@@ -239,7 +320,6 @@ export class MiniGolfGame {
     ring.position.y = -THICK - LEG_H + 0.001;
     g.add(ring);
 
-    g.visible = !this.xr;
     this.tableStand = g;
     this.courseGroup.add(g);
   }
@@ -378,19 +458,20 @@ export class MiniGolfGame {
   }
 
   /* ---------------- input ----------------
-   * One finger on the ball putts; one finger anywhere else walks the camera
-   * around the table; two fingers pinch-zoom (mouse: wheel zooms, drag
-   * putts/orbits the same way). Works identically for touch and mouse since
-   * it's driven entirely by ball-screen-proximity, not click buttons.
+   * One finger on the ball putts; one finger anywhere else either walks the
+   * sim camera around the table, or — during AR preview — rotates the
+   * placed-but-not-yet-confirmed table; two fingers pinch to zoom (sim) or
+   * resize (AR preview). Works identically for touch and mouse since it's
+   * driven entirely by ball-screen-proximity, not click buttons.
    */
   bindPuttInput() {
     const el = this.hud;
     const pointers = new Map(); // pointerId -> {x,y}
-    let mode = null; // 'putt' | 'orbit' | 'pinch'
-    let puttPointerId = null;
+    let mode = null; // 'putt' | 'orbit' | 'rotate' | 'pinch'
+    let dragPointerId = null;
     let puttStart = null;
-    let orbitLast = null;
-    let pinchStart = null; // {dist, radius}
+    let dragLast = null;
+    let pinchStart = null; // {dist, radius?, scale?}
 
     const flatAxes = () => {
       const cam = this.renderer.xr.isPresenting ? this.renderer.xr.getCamera() : this.camera;
@@ -429,6 +510,8 @@ export class MiniGolfGame {
       this.showPowerMeter(false);
     };
 
+    const canAdjustPlacement = () => this.xr && this.arPhase === 'preview';
+
     this._onDown = (e) => {
       if (e.target.closest && e.target.closest('button')) return;
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -438,20 +521,25 @@ export class MiniGolfGame {
         const nearBall = canPutt && (this.xr || Math.hypot(e.clientX - ballScreenPos().x, e.clientY - ballScreenPos().y) < 70);
         if (nearBall) {
           mode = 'putt';
-          puttPointerId = e.pointerId;
+          dragPointerId = e.pointerId;
           puttStart = { x: e.clientX, y: e.clientY };
           this.setPowerMeter(0);
           this.showPowerMeter(true);
+        } else if (canAdjustPlacement()) {
+          mode = 'rotate';
+          dragPointerId = e.pointerId;
+          dragLast = { x: e.clientX, y: e.clientY };
         } else if (!this.xr) {
           mode = 'orbit';
-          orbitLast = { x: e.clientX, y: e.clientY };
+          dragPointerId = e.pointerId;
+          dragLast = { x: e.clientX, y: e.clientY };
         } else {
           mode = null;
         }
-      } else if (pointers.size === 2 && !this.xr) {
+      } else if (pointers.size === 2 && (!this.xr || canAdjustPlacement())) {
         if (mode === 'putt') this.showPowerMeter(false);
         mode = 'pinch';
-        pinchStart = { dist: pinchDist(), radius: this.simOrbit.radius };
+        pinchStart = { dist: pinchDist(), radius: this.simOrbit?.radius, scale: this.courseGroup.scale.x };
       }
     };
 
@@ -461,13 +549,19 @@ export class MiniGolfGame {
 
       if (mode === 'pinch' && pointers.size >= 2) {
         const d = pinchDist();
-        if (d > 1) this.simOrbit.radius = Math.max(0.6, Math.min(2.8, pinchStart.radius * (pinchStart.dist / d)));
-      } else if (mode === 'orbit' && e.pointerId !== puttPointerId) {
-        const dx = e.clientX - orbitLast.x, dy = e.clientY - orbitLast.y;
+        if (d > 1) {
+          if (this.xr) this.courseGroup.scale.setScalar(Math.max(0.7, Math.min(1.5, pinchStart.scale * (d / pinchStart.dist))));
+          else this.simOrbit.radius = Math.max(0.6, Math.min(2.8, pinchStart.radius * (pinchStart.dist / d)));
+        }
+      } else if (mode === 'orbit' && e.pointerId === dragPointerId) {
+        const dx = e.clientX - dragLast.x, dy = e.clientY - dragLast.y;
         this.simOrbit.theta -= dx * 0.006;
         this.simOrbit.phi = Math.max(0.28, Math.min(1.45, this.simOrbit.phi - dy * 0.006));
-        orbitLast = { x: e.clientX, y: e.clientY };
-      } else if (mode === 'putt' && e.pointerId === puttPointerId) {
+        dragLast = { x: e.clientX, y: e.clientY };
+      } else if (mode === 'rotate' && e.pointerId === dragPointerId) {
+        this.courseGroup.rotation.y += (e.clientX - dragLast.x) * 0.008;
+        dragLast = { x: e.clientX, y: e.clientY };
+      } else if (mode === 'putt' && e.pointerId === dragPointerId) {
         this.setPowerMeter(Math.min(1, Math.hypot(e.clientX - puttStart.x, e.clientY - puttStart.y) / 220));
       }
     };
@@ -475,13 +569,15 @@ export class MiniGolfGame {
     this._onUp = (e) => {
       pointers.delete(e.pointerId);
 
-      if (mode === 'putt' && e.pointerId === puttPointerId) {
+      if (mode === 'putt' && e.pointerId === dragPointerId) {
         finishPutt(e.clientX, e.clientY);
-        mode = null; puttPointerId = null; puttStart = null;
+        mode = null; dragPointerId = null; puttStart = null;
       } else if (mode === 'pinch' && pointers.size < 2) {
-        const remaining = [...pointers.values()][0];
-        mode = remaining ? 'orbit' : null;
-        orbitLast = remaining || null;
+        const remainingId = [...pointers.keys()][0];
+        const remainingPos = pointers.get(remainingId);
+        if (remainingPos && canAdjustPlacement()) { mode = 'rotate'; dragPointerId = remainingId; dragLast = remainingPos; }
+        else if (remainingPos && !this.xr) { mode = 'orbit'; dragPointerId = remainingId; dragLast = remainingPos; }
+        else mode = null;
       } else if (pointers.size === 0) {
         mode = null;
       }
@@ -680,6 +776,14 @@ export class MiniGolfGame {
 
   /* ---------------- HUD ---------------- */
   buildHUD() {
+    const placementControls = this.xr ? `
+      <div class="mg-placement" id="mg-placement">
+        <button class="btn-primary" id="mg-place" disabled>Place</button>
+        <button class="btn-primary hidden" id="mg-confirm">Confirm</button>
+        <button class="btn-ghost hidden" id="mg-reposition">Reposition</button>
+      </div>
+      <button class="exit-btn hud-reset hidden" id="mg-reset" title="Reset placement">⟲</button>
+    ` : '';
     this.hud.innerHTML = `
       <div class="mg-hud">
         <div class="mg-top">
@@ -689,6 +793,7 @@ export class MiniGolfGame {
         <div class="power-wrap hidden" id="mg-power-wrap"><div class="power-bar" id="mg-power"></div></div>
         <div class="hud-banner hidden" id="mg-banner"></div>
         <div class="hud-hint" id="mg-hint"></div>
+        ${placementControls}
         <button class="exit-btn hud-exit" id="mg-exit">✕</button>
       </div>
     `;
@@ -699,8 +804,18 @@ export class MiniGolfGame {
       power: this.hud.querySelector('#mg-power'),
       banner: this.hud.querySelector('#mg-banner'),
       hint: this.hud.querySelector('#mg-hint'),
+      place: this.hud.querySelector('#mg-place'),
+      confirm: this.hud.querySelector('#mg-confirm'),
+      reposition: this.hud.querySelector('#mg-reposition'),
+      reset: this.hud.querySelector('#mg-reset'),
     };
     this.hud.querySelector('#mg-exit').addEventListener('click', () => this.stop());
+    if (this.xr) {
+      this.el.place.addEventListener('click', () => this.arPlaceHere());
+      this.el.confirm.addEventListener('click', () => this.arConfirm());
+      this.el.reposition.addEventListener('click', () => this.arReposition());
+      this.el.reset.addEventListener('click', () => this.arReset());
+    }
   }
 
   updateHudHole() {
@@ -729,7 +844,7 @@ export class MiniGolfGame {
     if (this._stopped) return;
     const dt = Math.min(0.05, this.clock.getDelta());
 
-    if (!this.placed && frame && this.hitTestSource && this.reticle) {
+    if (this.arPhase === 'searching' && frame && this.hitTestSource && this.reticle) {
       const hits = frame.getHitTestResults(this.hitTestSource);
       const refSpace = this.renderer.xr.getReferenceSpace();
       if (hits.length && refSpace) {
@@ -739,6 +854,7 @@ export class MiniGolfGame {
       } else {
         this.reticle.visible = false;
       }
+      if (this.el?.place) this.el.place.disabled = !this.reticle.visible;
     }
 
     if (!this.renderer.xr.isPresenting) this.updateSimCamera();
