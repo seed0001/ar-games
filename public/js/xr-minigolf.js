@@ -24,12 +24,27 @@ const REST_SPEED = 0.02;
 const SINK_SPEED = 0.9;
 const WALL_H = 0.006; // collision half-thickness of interior walls/perimeter
 
+/** one vivid neon hue per hole (1-indexed id), full saturation for a "pop" look */
+function neonColorHex(index0) {
+  return new THREE.Color().setHSL((((index0 % 18) + 18) % 18) / 18, 1, 0.5).getHex();
+}
+
 class SFX extends BaseSFX {
   putt()        { this.blip({ type: 'triangle', f0: 500, f1: 220, dur: 0.1,  vol: 0.22, noise: 0.05 }); }
   wallBounce()  { this.blip({ type: 'square',   f0: 700, f1: 380, dur: 0.05, vol: 0.12 }); }
   splash()      { this.blip({ type: 'sine',     f0: 320, f1: 60,  dur: 0.35, vol: 0.22, noise: 0.3 }); }
   sink()        { this.blip({ type: 'sine',     f0: 700, f1: 1400, dur: 0.4, vol: 0.28 }); }
   holeAdvance() { this.blip({ type: 'sine',     f0: 440, f1: 880, dur: 0.25, vol: 0.16 }); }
+  clap()        { this.blip({ type: 'square',   f0: 1200, f1: 900, dur: 0.04, vol: 0.18, noise: 0.35 }); }
+  slowClap() {
+    let t = 0;
+    for (const gap of [0, 300, 340, 380]) { t += gap; setTimeout(() => this.clap(), t); }
+  }
+  cheer() {
+    this.blip({ type: 'sawtooth', f0: 300, f1: 1400, dur: 0.5, vol: 0.22, noise: 0.35 });
+    setTimeout(() => this.blip({ type: 'triangle', f0: 800, f1: 1700, dur: 0.3, vol: 0.18 }), 120);
+  }
+  boo()         { this.blip({ type: 'sawtooth', f0: 220, f1: 105, dur: 0.9, vol: 0.22, noise: 0.15 }); }
 }
 
 /* ---------------- 2D geometry helpers (green-local XZ plane) ---------------- */
@@ -107,6 +122,7 @@ export class MiniGolfGame {
 
     this.buildBall();
     this.buildTableStand();
+    this.buildAimLine();
     this.buildHUD();
     this.bindPuttInput();
 
@@ -285,6 +301,45 @@ export class MiniGolfGame {
     this.courseGroup.add(this.ballMesh);
   }
 
+  /* ---------------- aim line ----------------
+   * Shown only while actively dragging a putt, so you can read the angle
+   * (and rough distance, via its length) before committing to the shot.
+   */
+  buildAimLine() {
+    const glowMat = () => new THREE.MeshBasicMaterial({ color: COL.edge, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false });
+    this.aimBeam = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 8, 1, true), glowMat());
+    this.aimBeam.visible = false;
+    this.courseGroup.add(this.aimBeam);
+    this.aimTip = new THREE.Mesh(new THREE.ConeGeometry(0.012, 0.03, 10), glowMat());
+    this.aimTip.visible = false;
+    this.courseGroup.add(this.aimTip);
+  }
+
+  updateAimLine(localDirX, localDirZ, power) {
+    const dir = new THREE.Vector3(localDirX, 0, localDirZ);
+    if (dir.lengthSq() < 1e-6) { this.hideAimLine(); return; }
+    dir.normalize();
+    const len = 0.08 + power * 0.45;
+    const radius = 0.0035;
+    const start = new THREE.Vector3(this.ballPos.x, BALL_RADIUS + 0.004, this.ballPos.z);
+    const end = start.clone().addScaledVector(dir, len);
+    const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+
+    this.aimBeam.position.copy(start).lerp(end, 0.5);
+    this.aimBeam.scale.set(radius, len, radius);
+    this.aimBeam.quaternion.copy(quat);
+    this.aimBeam.visible = true;
+
+    this.aimTip.position.copy(end);
+    this.aimTip.quaternion.copy(quat);
+    this.aimTip.visible = true;
+  }
+
+  hideAimLine() {
+    if (this.aimBeam) this.aimBeam.visible = false;
+    if (this.aimTip) this.aimTip.visible = false;
+  }
+
   /* ---------------- table stand ----------------
    * A rendered, walk-around-able elevated stand the course sits on — built
    * once, sized to comfortably fit every hole. Shown in both modes: in AR
@@ -321,7 +376,15 @@ export class MiniGolfGame {
     g.add(ring);
 
     this.tableStand = g;
+    this.standEdgeMat = edgeMat;
+    this.standRingMat = ring.material;
     this.courseGroup.add(g);
+  }
+
+  /** tint the stand's glow to match the current hole's neon color */
+  updateTableStandColor(hex) {
+    this.standEdgeMat.color.setHex(hex);
+    this.standRingMat.color.setHex(hex);
   }
 
   /* ---------------- hole load / geometry ---------------- */
@@ -331,11 +394,13 @@ export class MiniGolfGame {
       this.holeGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
     }
     this.decor = [];
+    this.effects = []; // any not-yet-expired burst/confetti belonged to the old (now-disposed) holeGroup
     const def = HOLES[index];
     this.currentHole = def;
     this.holeStrokes = 0;
     this.holeGroup = this.buildHoleGeometry(def);
     this.courseGroup.add(this.holeGroup);
+    this.updateTableStandColor(neonColorHex(def.id - 1));
 
     this.ballPos.x = def.tee[0];
     this.ballPos.z = def.tee[1];
@@ -352,10 +417,11 @@ export class MiniGolfGame {
   buildHoleGeometry(def) {
     const g = new THREE.Group();
     const { w, d } = def;
+    const neon = neonColorHex(def.id - 1); // this hole's signature neon color
 
     const green = new THREE.Mesh(
       new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2),
-      new THREE.MeshStandardMaterial({ color: COL.green, roughness: 0.85, map: this.gridTex, transparent: true, opacity: 1 })
+      new THREE.MeshStandardMaterial({ color: neon, emissive: neon, emissiveIntensity: 0.35, roughness: 0.6, metalness: 0.1, map: this.gridTex, transparent: true, opacity: 1 })
     );
     green.position.y = 0;
     g.add(green);
@@ -371,7 +437,7 @@ export class MiniGolfGame {
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(len, h, WALL_H * 2), wallMat);
       mesh.position.set((x1 + x2) / 2, h / 2, (z1 + z2) / 2);
       mesh.rotation.y = -Math.atan2(z2 - z1, x2 - x1);
-      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry), new THREE.LineBasicMaterial({ color: COL.edge, transparent: true, opacity: 0.7 }));
+      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry), new THREE.LineBasicMaterial({ color: neon, transparent: true, opacity: 0.7 }));
       mesh.add(edges);
       g.add(mesh);
       this.walls.push({ x1, z1, x2, z2 });
@@ -430,7 +496,7 @@ export class MiniGolfGame {
         g.add(post);
         const blade = new THREE.Mesh(
           new THREE.BoxGeometry(dcr.radius * 2, 0.008, 0.016),
-          new THREE.MeshStandardMaterial({ color: COL.edge, roughness: 0.4 })
+          new THREE.MeshStandardMaterial({ color: neon, roughness: 0.4 })
         );
         blade.position.set(dcr.x, 0.05, dcr.z);
         g.add(blade);
@@ -495,19 +561,24 @@ export class MiniGolfGame {
       return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
     };
 
+    // shared by the live aim-line preview and the actual shot on release
+    const computePuttDir = (dx, dy) => {
+      const { right, fwd } = flatAxes();
+      const pull = new THREE.Vector3().addScaledVector(right, dx).addScaledVector(fwd, -dy);
+      if (pull.lengthSq() < 1e-6) return null;
+      pull.normalize().multiplyScalar(-1); // shoot opposite of pull
+      return pull.applyQuaternion(this.courseGroup.quaternion.clone().invert());
+    };
+
     const finishPutt = (x, y) => {
       const dx = x - puttStart.x, dy = y - puttStart.y;
       const len = Math.hypot(dx, dy);
       if (len > 8) {
-        const { right, fwd } = flatAxes();
-        const pull = new THREE.Vector3().addScaledVector(right, dx).addScaledVector(fwd, -dy);
-        if (pull.lengthSq() > 1e-6) {
-          pull.normalize().multiplyScalar(-1); // shoot opposite of pull
-          const local = pull.clone().applyQuaternion(this.courseGroup.quaternion.clone().invert());
-          this.putt(local.x, local.z, Math.min(1, len / 220));
-        }
+        const local = computePuttDir(dx, dy);
+        if (local) this.putt(local.x, local.z, Math.min(1, len / 220));
       }
       this.showPowerMeter(false);
+      this.hideAimLine();
     };
 
     const canAdjustPlacement = () => this.xr && this.arPhase === 'preview';
@@ -537,7 +608,7 @@ export class MiniGolfGame {
           mode = null;
         }
       } else if (pointers.size === 2 && (!this.xr || canAdjustPlacement())) {
-        if (mode === 'putt') this.showPowerMeter(false);
+        if (mode === 'putt') { this.showPowerMeter(false); this.hideAimLine(); }
         mode = 'pinch';
         pinchStart = { dist: pinchDist(), radius: this.simOrbit?.radius, scale: this.courseGroup.scale.x };
       }
@@ -562,7 +633,12 @@ export class MiniGolfGame {
         this.courseGroup.rotation.y += (e.clientX - dragLast.x) * 0.008;
         dragLast = { x: e.clientX, y: e.clientY };
       } else if (mode === 'putt' && e.pointerId === dragPointerId) {
-        this.setPowerMeter(Math.min(1, Math.hypot(e.clientX - puttStart.x, e.clientY - puttStart.y) / 220));
+        const dx = e.clientX - puttStart.x, dy = e.clientY - puttStart.y;
+        const power = Math.min(1, Math.hypot(dx, dy) / 220);
+        this.setPowerMeter(power);
+        const local = computePuttDir(dx, dy);
+        if (local) this.updateAimLine(local.x, local.z, power);
+        else this.hideAimLine();
       }
     };
 
@@ -719,6 +795,15 @@ export class MiniGolfGame {
     const rel = this.holeStrokes - par;
     const label = rel <= -2 ? 'EAGLE!' : rel === -1 ? 'BIRDIE!' : rel === 0 ? 'PAR' : rel === 1 ? 'BOGEY' : 'IN THE HOLE';
     this.banner(`${label} · ${this.holeStrokes} strokes`, 1800);
+    if (rel <= -1) {
+      this.confettiBurst();
+      this.screenShake();
+      this.sfx.cheer();
+    } else if (rel === 0) {
+      this.sfx.slowClap();
+    } else {
+      this.sfx.boo();
+    }
     setTimeout(() => {
       if (this._stopped) return;
       if (this.holeIndex + 1 < HOLES.length) {
@@ -772,6 +857,36 @@ export class MiniGolfGame {
     const pts = new THREE.Points(geo, new THREE.PointsMaterial({ map: this.glowTex, color, size: 0.02, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
     this.holeGroup.add(pts);
     this.effects.push({ mesh: pts, vels, life: 0.6, maxLife: 0.6 });
+  }
+
+  /** rainbow confetti burst from the cup, for a birdie or better */
+  confettiBurst() {
+    const count = 70;
+    const geo = new THREE.BufferGeometry();
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const vels = [];
+    const cx = this.currentHole.cup[0], cz = this.currentHole.cup[1];
+    for (let i = 0; i < count; i++) {
+      positions.set([cx, 0.05, cz], i * 3);
+      const c = new THREE.Color().setHSL(Math.random(), 1, 0.6);
+      colors.set([c.r, c.g, c.b], i * 3);
+      vels.push(new THREE.Vector3((Math.random() - 0.5) * 2, Math.random() * 1.8 + 1, (Math.random() - 0.5) * 2).normalize().multiplyScalar(0.6 + Math.random() * 0.9));
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const pts = new THREE.Points(geo, new THREE.PointsMaterial({ size: 0.018, vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+    this.holeGroup.add(pts);
+    this.effects.push({ mesh: pts, vels, life: 1.4, maxLife: 1.4, gravity: -1.8 });
+  }
+
+  /** brief CSS shake on the render container — device-agnostic, works in AR (real camera can't be moved) and sim alike */
+  screenShake() {
+    this.container.classList.remove('mg-screenshake');
+    void this.container.offsetWidth; // force reflow so re-adding the class restarts the animation
+    this.container.classList.add('mg-screenshake');
+    clearTimeout(this._shakeT);
+    this._shakeT = setTimeout(() => this.container.classList.remove('mg-screenshake'), 520);
   }
 
   /* ---------------- HUD ---------------- */
@@ -876,6 +991,7 @@ export class MiniGolfGame {
       }
       const pos = fx.mesh.geometry.attributes.position;
       for (let j = 0; j < fx.vels.length; j++) {
+        if (fx.gravity) fx.vels[j].y += fx.gravity * dt;
         pos.array[j * 3] += fx.vels[j].x * dt;
         pos.array[j * 3 + 1] += fx.vels[j].y * dt;
         pos.array[j * 3 + 2] += fx.vels[j].z * dt;
