@@ -126,11 +126,17 @@ app.get('/api/me', auth(false), (req, res) => {
   res.json({ user: req.user ? { id: req.user.id, username: req.user.username } : null });
 });
 
-const VALID_MODES = new Set(['shooter', 'gauntlet']);
+// scores for these modes are computed and posted by the client (shooter/gauntlet
+// combat scoring, minigolf stroke scoring) — safe to trust because a fabricated
+// high score only cheats a leaderboard, never another player's game state.
+const CLIENT_SCORE_MODES = new Set(['shooter', 'gauntlet', 'minigolf']);
+// 'uno' is leaderboard-readable but never client-POSTed — wins are written
+// server-side only, by the realtime layer, so a client can't fabricate one
+const LEADERBOARD_MODES = new Set([...CLIENT_SCORE_MODES, 'uno']);
 
 app.post('/api/scores', auth(), (req, res) => {
   const { mode, score } = req.body || {};
-  if (!VALID_MODES.has(mode)) return res.status(400).json({ error: 'Unknown mode' });
+  if (!CLIENT_SCORE_MODES.has(mode)) return res.status(400).json({ error: 'Unknown mode' });
   const s = Math.floor(Number(score));
   if (!Number.isFinite(s) || s < 0 || s > 1000000) return res.status(400).json({ error: 'Invalid score' });
   db.prepare('INSERT INTO scores (user_id, mode, score) VALUES (?, ?, ?)').run(req.user.id, mode, s);
@@ -140,7 +146,7 @@ app.post('/api/scores', auth(), (req, res) => {
 
 app.get('/api/leaderboard', auth(false), (req, res) => {
   const mode = String(req.query.mode || '');
-  if (!VALID_MODES.has(mode)) return res.status(400).json({ error: 'Unknown mode' });
+  if (!LEADERBOARD_MODES.has(mode)) return res.status(400).json({ error: 'Unknown mode' });
   const rows = db.prepare(`
     SELECT u.username, MAX(s.score) AS best
     FROM scores s JOIN users u ON u.id = s.user_id
@@ -272,6 +278,7 @@ app.post('/api/clientlog', auth(false), (req, res) => {
 app.use('/vendor/three', express.static(path.join(__dirname, 'node_modules/three/build'), { maxAge: '7d' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`camfun running on http://localhost:${PORT}`);
 });
+require('./realtime')(server, db);

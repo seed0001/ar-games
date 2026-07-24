@@ -774,3 +774,191 @@ body { overflow: hidden; }
   cursor: pointer;
 }
 
+/* ---------- MINI-GOLF HUD ---------- */
+.mg-hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+}
+.mg-hud button { pointer-events: auto; }
+
+.mg-top {
+  position: absolute;
+  top: max(14px, env(safe-area-inset-top));
+  left: 70px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: rgba(8, 10, 18, 0.6);
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  padding: 8px 16px;
+}
+.mg-holeinfo { font-size: 13.5px; font-weight: 700; color: var(--text); }
+.mg-strokes { font-size: 22px; font-weight: 900; color: #fff; text-shadow: 0 0 12px rgba(88, 255, 150, 0.8); }
+
+.power-wrap {
+  position: absolute;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  width: 160px;
+  height: 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.power-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #58ff96, #ffd34d, #ff5c3a);
+}
+
+.mg-scorecard { max-width: 340px; }
+.mg-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 13px; max-height: 260px; }
+.mg-table th, .mg-table td { padding: 4px 8px; text-align: center; color: var(--dim); }
+.mg-table th { color: var(--text); border-bottom: 1px solid var(--card-border); }
+
+/* ---------- UNO LOBBY ---------- */
+.lobby-or { text-align: center; color: var(--dim); font-size: 13px; margin: 16px 0; }
+.lobby-join-row { display: flex; gap: 8px; }
+.lobby-join-row input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  color: var(--text);
+  font-size: 18px;
+  letter-spacing: 3px;
+  text-align: center;
+  text-transform: uppercase;
+}
+.lobby-join-row .btn-secondary { width: auto; padding: 12px 20px; }
+.lobby-error { color: var(--danger); font-size: 13px; text-align: center; margin-top: 14px; }
+.lobby-waiting { text-align: center; padding: 10px 0; }
+.lobby-code-display {
+  font-size: 42px;
+  font-weight: 900;
+  letter-spacing: 8px;
+  background: linear-gradient(90deg, var(--accent1), var(--accent2));
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  margin-bottom: 12px;
+}
+.lobby-hint { color: var(--dim); font-size: 14px; margin-bottom: 20px; }
+.lobby-spinner {
+  width: 30px; height: 30px;
+  margin: 0 auto;
+  border: 3px solid var(--card-border);
+  border-top-color: var(--accent2);
+  border-radius: 50%;
+  animation: lobbyspin 0.8s linear infinite;
+}
+@keyframes lobbyspin { to { transform: rotate(360deg); } }
+
+/* ---------- UNO HUD ---------- */
+.uno-hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+}
+.uno-hud button, .uno-hud input { pointer-events: auto; }
+
+.uno-top {
+  position: absolute;
+  top: max(14px, env(safe-area-inset-top));
+  left: 70px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: rgba(8, 10, 18, 0.6);
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  padding: 8px 16px;
+}
+.uno-turn { font-size: 14px; font-weight: 700; color: var(--dim); }
+.uno-turn.my-turn { color: #58ff96; text-shadow: 0 0 10px rgba(88,255,150,0.7); }
+.uno-opp { font-size: 13px; color: var(--dim); }
+
+.uno-log {
+  position: absolute;
+  top: calc(max(14px, env(safe-area-inset-top)) + 46px);
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 12.5px;
+  color: var(--dim);
+  background: rgba(8, 10, 18, 0.55);
+  border-radius: 999px;
+  padding: 5px 14px;
+  max-width: 80vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.uno-colorpicker {
+  position: absolute;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  gap: 14px;
+  background: rgba(8, 10, 18, 0.85);
+  border: 1px solid var(--card-border);
+  border-radius: 20px;
+  padding: 18px;
+  z-index: 20;
+}
+.uno-swatch {
+  width: 46px; height: 46px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.4);
+  background: var(--sw);
+  cursor: pointer;
+}
+
+.uno-hand {
+  position: absolute;
+  bottom: max(76px, calc(env(safe-area-inset-bottom) + 66px));
+  left: 0; right: 0;
+  display: flex;
+  justify-content: center;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 10px;
+}
+.uno-card {
+  width: 44px; height: 62px;
+  border-radius: 8px;
+  border: 2px solid rgba(255,255,255,0.5);
+  background: var(--card-color);
+  color: #fff;
+  font-weight: 900;
+  font-size: 16px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  transform: rotate(calc((var(--i) - 3) * 4deg));
+  transition: transform 0.15s;
+}
+.uno-card:active { transform: translateY(-10px) rotate(calc((var(--i) - 3) * 4deg)); }
+
+.uno-actions {
+  position: absolute;
+  bottom: max(20px, env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+}
+.uno-actions .btn-ghost { border-radius: 999px; padding: 10px 20px; }
+.uno-actions .btn-ghost.armed { background: rgba(88,255,150,0.35); border-color: #58ff96; color: #fff; }
+

@@ -1,6 +1,9 @@
 import { tlog, flush } from './telemetry.js';
 import { ShooterGame, arSupported } from './xr-shooter.js';
 import { GauntletGame } from './xr-gauntlet.js';
+import { MiniGolfGame } from './xr-minigolf.js';
+import { openLobby } from './lobby.js';
+import { UnoGame } from './xr-uno.js';
 import { WorldScanner } from './world-scanner.js';
 import { WorldExplorer } from './world-explorer.js';
 
@@ -45,6 +48,18 @@ const MODES = [
     desc: 'A 100-foot hard-light obstacle course deploys down your driveway. Physically run it — duck behind barricades, clear each zone of drones to unlock the gate, and race the clock to the finish line. Leaderboard.',
     leaderboard: true,
     launch: launchGauntlet,
+  },
+  {
+    id: 'minigolf', icon: '⛳', name: 'Mini-Golf', glow: 'rgba(88,255,150,0.22)',
+    desc: 'An 18-hole course deploys onto your real tabletop, one hole at a time. Drag back and release to putt — ramps, water, sand, and windmills included. Leaderboard.',
+    leaderboard: true,
+    launch: launchMiniGolf,
+  },
+  {
+    id: 'uno', icon: '🃏', name: 'Uno', glow: 'rgba(138,92,255,0.25)',
+    desc: 'Play Uno with a friend, each of you on your own phone — a table deploys onto your own real tabletop while the game itself stays perfectly in sync between you. Leaderboard tracks total wins.',
+    leaderboard: true,
+    launch: launchUnoLobby,
   },
   {
     id: 'scanner', icon: '🌍', name: 'World Scanner', glow: 'rgba(0,255,170,0.22)',
@@ -263,6 +278,83 @@ async function launchGauntlet(modeDef) {
       freshBtn.disabled = false;
     }
   }, { once: true });
+}
+
+// ---------- mini-golf launch ----------
+async function launchMiniGolf(modeDef) {
+  const xr = await arSupported();
+  show('stage');
+  $('hud').innerHTML = '';
+
+  $('intro-icon').textContent = modeDef.icon;
+  $('intro-title').textContent = modeDef.name;
+  $('intro-desc').textContent = xr
+    ? 'Find a real tabletop. Aim at it and tap to place the course, then drag back on the ball and release to putt — same feel as a slingshot. The course stays put as you play all 18 holes.'
+    : 'No AR on this device — launching the desktop version so you can try the course. The real experience runs in Chrome on Android.';
+  $('intro-perms').textContent = xr ? 'uses AR camera + motion tracking' : 'desktop mode (mouse drag + scroll)';
+  $('intro').classList.remove('hidden');
+
+  const startBtn = $('intro-start');
+  const freshBtn = startBtn.cloneNode(true);
+  freshBtn.textContent = xr ? 'Enter AR' : 'Launch course';
+  startBtn.replaceWith(freshBtn);
+
+  freshBtn.addEventListener('click', async () => {
+    freshBtn.disabled = true;
+    try {
+      game = new MiniGolfGame({
+        container: $('gl-container'),
+        hud: $('hud'),
+        xr,
+        onExit: () => { game = null; show('hub'); },
+      });
+      await game.start();
+      window.__game = game; // debug handle
+      $('intro').classList.add('hidden');
+    } catch (err) {
+      console.error(err);
+      toast('Could not start AR: ' + err.message, 4500);
+      game = null;
+      show('hub');
+    } finally {
+      freshBtn.disabled = false;
+    }
+  }, { once: true });
+}
+
+// ---------- uno launch ----------
+async function launchUnoLobby(modeDef) {
+  try {
+    await openLobby({
+      gameType: 'uno',
+      gameLabel: modeDef.name,
+      onMatched: async ({ roomId, playerId, seat, rt }) => {
+        const xr = await arSupported();
+        show('stage');
+        $('hud').innerHTML = '';
+        $('intro').classList.add('hidden');
+        try {
+          game = new UnoGame({
+            container: $('gl-container'),
+            hud: $('hud'),
+            xr,
+            room: { roomId, playerId, seat, rt },
+            onExit: () => { game = null; show('hub'); },
+          });
+          await game.start();
+          window.__game = game; // debug handle
+        } catch (err) {
+          console.error(err);
+          toast('Could not start AR: ' + err.message, 4500);
+          game = null;
+          show('hub');
+        }
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    toast('Could not connect: ' + err.message, 4500);
+  }
 }
 
 // ---------- world scanner launch ----------
