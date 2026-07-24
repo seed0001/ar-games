@@ -57,7 +57,7 @@ const MODES = [
   },
   {
     id: 'uno', icon: '🃏', name: 'Uno', glow: 'rgba(138,92,255,0.25)',
-    desc: 'Play Uno with a friend, each of you on your own phone — a table deploys onto your own real tabletop while the game itself stays perfectly in sync between you. Leaderboard tracks total wins.',
+    desc: 'Play Uno solo against a bot, or with a friend — each of you on your own phone, a table deploying onto your own real tabletop while the game stays perfectly in sync between you. Leaderboard tracks total wins against real opponents.',
     leaderboard: true,
     launch: launchUnoLobby,
   },
@@ -328,6 +328,7 @@ async function launchUnoLobby(modeDef) {
     await openLobby({
       gameType: 'uno',
       gameLabel: modeDef.name,
+      supportsBot: true,
       onMatched: async ({ roomId, playerId, seat, rt }) => {
         const xr = await arSupported();
         show('stage');

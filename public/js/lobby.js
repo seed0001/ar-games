@@ -8,7 +8,7 @@ const $ = (id) => document.getElementById(id);
  * Resolves nothing itself; calls onMatched({roomId, playerId, seat, rt})
  * once both seats are filled, then closes the modal.
  */
-export async function openLobby({ gameType, gameLabel = 'Game', onMatched }) {
+export async function openLobby({ gameType, gameLabel = 'Game', supportsBot = false, onMatched }) {
   const rt = new RealtimeClient();
 
   $('modal-title').textContent = `${gameLabel} — Room`;
@@ -27,7 +27,11 @@ export async function openLobby({ gameType, gameLabel = 'Game', onMatched }) {
 
   function renderChoose(error) {
     $('modal-body').innerHTML = `
-      <button class="btn-primary" id="lobby-create">Create room</button>
+      ${supportsBot ? `
+        <button class="btn-primary" id="lobby-bot">🤖 Play vs Bot</button>
+        <div class="lobby-or">— or play a friend —</div>
+      ` : ''}
+      <button class="${supportsBot ? 'btn-secondary' : 'btn-primary'}" id="lobby-create">Create room</button>
       <div class="lobby-or">— or join one —</div>
       <div class="lobby-join-row">
         <input id="lobby-code" maxlength="4" placeholder="CODE" autocapitalize="characters" autocomplete="off">
@@ -35,6 +39,11 @@ export async function openLobby({ gameType, gameLabel = 'Game', onMatched }) {
       </div>
       ${error ? `<div class="lobby-error">${error}</div>` : ''}
     `;
+    if (supportsBot) {
+      $('modal-body').querySelector('#lobby-bot').addEventListener('click', () => {
+        rt.send('room:create', { gameType, vsBot: true });
+      });
+    }
     $('modal-body').querySelector('#lobby-create').addEventListener('click', () => {
       rt.send('room:create', { gameType });
     });
@@ -53,10 +62,10 @@ export async function openLobby({ gameType, gameLabel = 'Game', onMatched }) {
       </div>`;
   }
 
-  function renderConnecting() {
+  function renderConnecting(hint = 'Joining room…') {
     $('modal-body').innerHTML = `
       <div class="lobby-waiting">
-        <p class="lobby-hint">Joining room…</p>
+        <p class="lobby-hint">${hint}</p>
         <div class="lobby-spinner"></div>
       </div>`;
   }
@@ -64,7 +73,8 @@ export async function openLobby({ gameType, gameLabel = 'Game', onMatched }) {
   rt.on('room:created', (payload) => {
     rt.roomId = payload.roomId;
     rt.saveSession({ roomId: payload.roomId, playerId: payload.playerId, reconnectToken: payload.reconnectToken, seat: payload.seat, gameType });
-    renderWaiting(payload.code);
+    if (payload.vsBot) renderConnecting('Setting up your bot opponent…');
+    else renderWaiting(payload.code);
   });
 
   rt.on('room:joined', (payload) => {

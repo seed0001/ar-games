@@ -2,8 +2,10 @@ const { WebSocketServer } = require('ws');
 const jwt = require('jsonwebtoken');
 const { RoomManager } = require('./rooms');
 const uno = require('./uno-engine');
+const unoBot = require('./uno-bot');
 
 const HEARTBEAT_MS = 20_000;
+const BOT_TURN_DELAY = () => 700 + Math.random() * 500; // feels less robotic than an instant move
 
 function parseCookie(header, name) {
   if (!header) return null;
@@ -25,6 +27,9 @@ gameTypes.set('uno', {
   viewFor: (state, playerId) => uno.viewFor(state, playerId),
   stateMessageType: 'uno:state',
   winnerOf: (state) => state.winner,
+  currentPlayerOf: (state) => state.order[state.turnIndex],
+  supportsBot: true,
+  chooseBotAction: (state, botId, alreadyDrewThisTurn) => unoBot.chooseBotAction(state, botId, alreadyDrewThisTurn),
 });
 
 module.exports = function attachRealtime(server, db) {
@@ -52,6 +57,7 @@ module.exports = function attachRealtime(server, db) {
   }
 
   function creditWin(room) {
+    if (room.vsBot) return; // practice mode — doesn't touch the real-opponent leaderboard
     const gt = gameTypes.get(room.gameType);
     const winnerPlayerId = gt.winnerOf(room.state);
     if (!winnerPlayerId) return;
@@ -67,6 +73,34 @@ module.exports = function attachRealtime(server, db) {
       if (p.connected && p.ws) send(p.ws, 'room:opponent-left', { reason });
     }
     rooms.leaveRoom(room.roomId);
+  }
+
+  /** once a room has its full player count, create game state and kick things off */
+  function startGameIfReady(room) {
+    const gt = gameTypes.get(room.gameType);
+    if (room.players.length !== room.maxPlayers) return;
+    room.state = gt.createState(room.players.map((p) => p.playerId));
+    rooms.broadcast(room, () => ({ type: 'room:ready', payload: {} }));
+    broadcastState(room);
+    maybeTakeBotTurn(room);
+  }
+
+  /** if it's now the bot's turn, play it out (possibly several actions: draw, then play-or-pass) */
+  function maybeTakeBotTurn(room, hasDrawn = false) {
+    if (!room.vsBot || !room.state || room.state.status !== 'playing') return;
+    const gt = gameTypes.get(room.gameType);
+    const bot = room.players.find((p) => p.meta?.isBot);
+    if (!bot || gt.currentPlayerOf(room.state) !== bot.playerId) return;
+    setTimeout(() => {
+      if (!rooms.getRoom(room.roomId) || room.state.status !== 'playing') return;
+      if (gt.currentPlayerOf(room.state) !== bot.playerId) return; // safety: state may have changed
+      const action = gt.chooseBotAction(room.state, bot.playerId, hasDrawn);
+      const result = gt.applyAction(room.state, bot.playerId, action);
+      if (!result.ok) return; // bot logic should never produce an illegal move, but never let a bad one wedge the game
+      broadcastState(room);
+      if (result.gameOver) { creditWin(room); return; }
+      maybeTakeBotTurn(room, hasDrawn || action.type === 'draw');
+    }, BOT_TURN_DELAY());
   }
 
   wss.on('connection', (ws, req) => {
@@ -92,10 +126,17 @@ module.exports = function attachRealtime(server, db) {
         const gameType = payload?.gameType;
         const gt = gameTypes.get(gameType);
         if (!gt) return send(ws, 'error', { code: 'unknown_game', message: 'Unknown game type' });
+        const vsBot = !!payload?.vsBot;
+        if (vsBot && !gt.supportsBot) return send(ws, 'error', { code: 'no_bot', message: 'This game has no bot opponent yet' });
         const { room, player } = rooms.createRoom(gameType, gt.maxPlayers, { userId: authedUser.id, username: authedUser.username });
         rooms.attachSocket(room.roomId, player.playerId, ws);
         conn.roomId = room.roomId; conn.playerId = player.playerId;
-        send(ws, 'room:created', { roomId: room.roomId, code: room.code, playerId: player.playerId, reconnectToken: player.reconnectToken, seat: player.seat });
+        if (vsBot) {
+          room.vsBot = true;
+          rooms.addBotPlayer(room);
+        }
+        send(ws, 'room:created', { roomId: room.roomId, code: room.code, playerId: player.playerId, reconnectToken: player.reconnectToken, seat: player.seat, vsBot });
+        startGameIfReady(room);
         return;
       }
 
@@ -107,13 +148,7 @@ module.exports = function attachRealtime(server, db) {
         conn.roomId = room.roomId; conn.playerId = player.playerId;
         send(ws, 'room:joined', { roomId: room.roomId, playerId: player.playerId, reconnectToken: player.reconnectToken, seat: player.seat });
         notifyOthers(room, player.playerId, 'room:player-joined', { seat: player.seat, playerCount: room.players.length });
-
-        const gt = gameTypes.get(room.gameType);
-        if (room.players.length === room.maxPlayers) {
-          room.state = gt.createState(room.players.map((p) => p.playerId));
-          rooms.broadcast(room, () => ({ type: 'room:ready', payload: {} }));
-          broadcastState(room);
-        }
+        startGameIfReady(room);
         return;
       }
 
@@ -142,7 +177,8 @@ module.exports = function attachRealtime(server, db) {
         const result = gt.applyAction(room.state, conn.playerId, payload?.action);
         if (!result.ok) return send(ws, 'error', { code: 'invalid_action', message: result.error });
         broadcastState(room);
-        if (result.gameOver) creditWin(room);
+        if (result.gameOver) { creditWin(room); return; }
+        maybeTakeBotTurn(room);
         return;
       }
     });

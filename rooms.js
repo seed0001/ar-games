@@ -68,6 +68,20 @@ class RoomManager {
     return this.byId.get(roomId);
   }
 
+  /** fills the next seat with a synthetic, always-connected bot player (no real socket) */
+  addBotPlayer(room) {
+    const player = {
+      playerId: crypto.randomUUID(),
+      seat: room.players.length,
+      ws: null,
+      connected: false,
+      reconnectToken: null,
+      meta: { isBot: true, username: 'Bot' },
+    };
+    room.players.push(player);
+    return player;
+  }
+
   findPlayer(room, playerId) {
     return room?.players.find((p) => p.playerId === playerId) || null;
   }
